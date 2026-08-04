@@ -119,7 +119,21 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
-    
+
+    "document_search": {
+        "description": (
+            "Search PDF, Word (.doc/.docx), and HTML documents by keyword and "
+            "meaning via NVIDIA NeMo Retriever (BM25 lexical + dense hybrid "
+            "retrieval). Use for 'search my documents' over document corpora "
+            "instead of a ripgrep scan of binary files. Available when "
+            "NVIDIA_API_KEY is set (remote NeMo Retriever) or "
+            "`document_search.local: true` is configured. Off by default; "
+            "enable in `hermes tools` → Document Search."
+        ),
+        "tools": ["document_search"],
+        "includes": []
+    },
+
     "vision": {
         "description": "Image analysis and vision tools",
         "tools": ["vision_analyze"],

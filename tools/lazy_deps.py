@@ -116,6 +116,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
 
+    # ─── Document search (NVIDIA NeMo Retriever) ───────────────────────────
+    # Backs the opt-in `document_search` tool (BM25 lexical + dense hybrid
+    # retrieval over PDF/Word/HTML corpora). Heavy SDK (LanceDB, embedding NIM
+    # clients, ray) that is Python 3.12-only, so it is deliberately NOT a core
+    # dep or an eager extra — it installs on first use of the tool, only after
+    # the user has set NVIDIA_API_KEY and enabled the toolset. On unsupported
+    # interpreters the pip install fails cleanly and surfaces as
+    # FeatureUnavailable rather than breaking the base install.
+    "document_search.nemo_retriever": ("nemo-retriever==26.5.0",),
+
     # ─── Monitoring ─────────────────────────────────────────────────────────
     # OTLP gateway monitoring export. Lazily installed on first use of
     # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the

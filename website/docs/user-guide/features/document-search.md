@@ -1,0 +1,130 @@
+---
+title: Document Search (NeMo Retriever)
+description: Search PDF, Word, and HTML document collections by meaning and keyword using NVIDIA NeMo Retriever's BM25 + hybrid retrieval, instead of a ripgrep scan of binary files.
+sidebar_label: Document Search
+sidebar_position: 8
+---
+
+# Document Search (NVIDIA NeMo Retriever)
+
+The `document_search` tool lets the agent search a collection of **documents** —
+PDFs, Word files (`.doc` / `.docx`), and HTML pages — by keyword and meaning.
+It is backed by [NVIDIA NeMo Retriever](https://github.com/NVIDIA/NeMo-Retriever):
+documents are parsed and indexed into a local
+[LanceDB](https://lancedb.github.io/lancedb/) table, and queries run through
+**BM25 lexical + dense hybrid retrieval** (fused with Reciprocal Rank Fusion).
+The agent gets back the most relevant passages with their source file and page.
+
+**Use this instead of file search when the target is a document corpus.** A PDF
+or `.docx` is a compressed binary — a ripgrep-style scan of the raw bytes
+returns noise, not the text. `document_search` reads the *content*.
+For source code and plain-text files, keep using regular file search.
+
+## When it's available
+
+`document_search` is an **opt-in, service-gated** tool. It stays completely out
+of the model's tool schema — and the heavy `nemo-retriever` SDK stays
+uninstalled — unless **both** of these are true:
+
+1. The `document_search` toolset is enabled in `hermes tools`.
+2. NeMo Retriever is configured, i.e. either:
+   - `NVIDIA_API_KEY` is set (remote inference against
+     [build.nvidia.com](https://build.nvidia.com/) or a NIM endpoint), **or**
+   - `document_search.local: true` is set in `config.yaml` (a local
+     GPU deployment).
+
+```bash
+hermes tools
+# → 📚 Document Search   (press space to toggle on)
+```
+
+The first query over a new set of documents builds a local index (this can take
+a while for large corpora and needs enough chunks to train LanceDB's index —
+point it at a directory of documents, not a single tiny file). Later queries
+reuse the index unless you pass `reindex: true`.
+
+:::note Python 3.12
+The `nemo-retriever` package requires Python 3.12. It is installed on demand
+the first time the tool runs (like the Exa / Firecrawl web-search backends), and
+is never part of the base install. On other interpreters the install fails with
+a clear message rather than affecting the rest of Hermes.
+:::
+
+## Configuration
+
+```yaml
+# ~/.hermes/config.yaml
+document_search:
+  backend: nemo_retriever   # only backend today
+  local: false              # true = local GPU deployment (no NVIDIA_API_KEY needed)
+  top_k: 5                  # passages returned per query (1-50)
+  hybrid: true              # BM25 full-text + dense vector (RRF); false = BM25-only
+  rerank: false             # apply the NeMo reranker NIM on top of retrieval
+  index_dir: ""             # LanceDB directory; blank = HERMES_HOME/nemo_retriever
+  embedding_model: nvidia/llama-nemotron-embed-1b-v2
+  embedding_endpoint: https://integrate.api.nvidia.com/v1/embeddings
+  extract_method: ""        # blank = default; "nemotron_parse" for scanned/image PDFs
+  max_chars: 20000          # cap on returned passage text length
+```
+
+Set `hybrid: false` for pure BM25 lexical retrieval (no embedding step at query
+time). Indexes persist under `HERMES_HOME/nemo_retriever` by default, so each
+[profile](../../reference/profiles.md) gets its own.
+
+## Tool parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string (required) | Natural-language or keyword query. |
+| `paths` | string array (required) | Document files (`.pdf`/`.doc`/`.docx`/`.html`/`.htm`) or directories containing them. |
+| `top_k` | integer | Max passages to return (default from config, 1–50). |
+| `index_name` | string | Optional name to reuse a persistent index across turns. Omit to derive one from the document set automatically. |
+| `reindex` | boolean | Rebuild the index even if one already exists for these documents. |
+
+The tool returns JSON with `backend`, `retrieval` (`bm25+hybrid` or `bm25`),
+`index`, `indexed_documents`, `reindexed`, `count`, and a `hits` array of
+`{text, score, source, page}` objects.
+
+## Example
+
+> Search my reports folder for what the Q3 filing says about supply-chain risk.
+
+The agent will:
+
+1. Call `document_search` with `query="Q3 filing supply-chain risk"` and
+   `paths=["~/reports"]`.
+2. On first use, parse and index every PDF/Word/HTML document in that folder.
+3. Return the top passages — each with its source filename and page — for the
+   model to summarize and cite.
+
+## Troubleshooting
+
+### "Document search is not configured"
+
+Set `NVIDIA_API_KEY` in `~/.hermes/.env` (from
+[build.nvidia.com](https://build.nvidia.com/)), or set
+`document_search.local: true` for a local GPU deployment. Then restart your
+session so the agent re-reads the tool registry.
+
+### Tool doesn't appear in the schema
+
+Two possible causes:
+
+1. **Toolset not enabled.** Run `hermes tools` and confirm `📚 Document Search`
+   is checked.
+2. **Not configured.** The `check_fn` returns `False` when neither
+   `NVIDIA_API_KEY` nor `document_search.local` is set, so the schema stays
+   hidden.
+
+### "NVIDIA NeMo Retriever SDK is not installed"
+
+The lazy install failed — most often because the interpreter is not Python 3.12,
+or lazy installs are disabled (`security.allow_lazy_installs: false`). Install
+manually into the agent's environment with `pip install nemo-retriever==26.5.0`
+under a Python 3.12 venv.
+
+## See Also
+
+- [Web Search & Extract](web-search.md) — for general web pages and PDF *URLs*
+- [Tools Reference](../../reference/tools-reference.md) — full tool catalog
+- [NVIDIA NeMo Retriever](https://github.com/NVIDIA/NeMo-Retriever) — upstream SDK

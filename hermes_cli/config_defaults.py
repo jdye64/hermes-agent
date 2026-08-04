@@ -329,6 +329,26 @@ DEFAULT_CONFIG = {
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
     },
 
+    # Document search via NVIDIA NeMo Retriever (the `document_search` tool /
+    # opt-in toolset). Routes "search my PDFs / Word docs / HTML pages" through
+    # BM25 lexical + dense hybrid retrieval instead of a ripgrep scan of binary
+    # files. The tool is invisible unless NVIDIA_API_KEY is set (remote
+    # build.nvidia.com / NIM inference) or `local: true` (local GPU
+    # deployment), AND the `document_search` toolset is enabled in `hermes
+    # tools`. Indexes persist under HERMES_HOME/nemo_retriever by default.
+    "document_search": {
+        "backend": "nemo_retriever",  # only backend today
+        "local": False,               # true for a local GPU NeMo Retriever deployment (no NVIDIA_API_KEY needed)
+        "top_k": 5,                   # passages returned per query (1-50)
+        "hybrid": True,               # BM25 full-text + dense vector fused via RRF; false = BM25-only
+        "rerank": False,              # apply the NeMo reranker NIM on top of retrieval
+        "index_dir": "",              # LanceDB directory; blank = HERMES_HOME/nemo_retriever
+        "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
+        "embedding_endpoint": "https://integrate.api.nvidia.com/v1/embeddings",
+        "extract_method": "",         # blank = SDK default; "nemotron_parse" for scanned/image PDFs
+        "max_chars": 20000,           # cap on returned passage text length
+    },
+
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)

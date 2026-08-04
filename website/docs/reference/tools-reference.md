@@ -226,6 +226,12 @@ The single `video_generate` tool covers both modalities — pass `image_url` to 
 |------|-------------|----------------------|
 | `x_search` | Search X (Twitter) posts, profiles, and threads using xAI's built-in `x_search` Responses tool. Read-only public X discovery for current discussion, reactions, or claims on public X (not general web pages). Does not post, reply, like, DM, upload media, delete, or inspect the authenticated X account — those need a separate authenticated X API surface (e.g. the `xurl` skill). Off by default — opt in via `hermes tools` → 🐦 X (Twitter) Search. Schema is only registered when xAI credentials are configured (check_fn-gated). | XAI_API_KEY **or** xAI Grok OAuth (SuperGrok / Premium+) login |
 
+## `document_search` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `document_search` | Search PDF, Word (`.doc`/`.docx`), and HTML document collections by keyword and meaning using NVIDIA NeMo Retriever (BM25 lexical + dense hybrid retrieval over a local LanceDB index). Returns the most relevant passages with source file and page — for document corpora, not source code (use file search for that). Off by default — opt in via `hermes tools` → 📚 Document Search. Schema is only registered when NeMo Retriever is configured (check_fn-gated); the heavy `nemo-retriever` SDK (Python 3.12) is lazy-installed on first use. | NVIDIA_API_KEY **or** `document_search.local: true` (local GPU deployment) |
+
 ## `tts` toolset
 
 | Tool | Description | Requires environment |

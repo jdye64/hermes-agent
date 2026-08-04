@@ -112,6 +112,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/wake-word',
             'user-guide/features/web-search',
             'user-guide/features/x-search',
+            'user-guide/features/document-search',
             'user-guide/features/browser',
             'user-guide/features/computer-use',
             'user-guide/features/vision',
