@@ -292,11 +292,13 @@ _EXTRA_ENV_KEYS = frozenset({
     "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL",
     "IRC_USE_TLS", "IRC_SERVER_PASSWORD", "IRC_NICKSERV_PASSWORD",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
-    # Deprecated tool-progress env vars — replaced by display.tool_progress in
-    # config.yaml. Kept known here so reload and compatibility paths still
-    # handle them for existing users (gateway reads them as a back-compat fallback),
-    # without surfacing them in user-facing OPTIONAL_ENV_VARS listings.
-    "HERMES_TOOL_PROGRESS", "HERMES_TOOL_PROGRESS_MODE",
+    # HERMES_TOOL_PROGRESS_MODE is deprecated (replaced by display.tool_progress
+    # in config.yaml) but STILL READ at runtime by the gateway as a back-compat
+    # fallback, so it must stay known to reload/compat paths. The boolean
+    # HERMES_TOOL_PROGRESS variant is fully unsupported since the v12 config
+    # support floor retired its only consumer (the v3→4 migration): it is no
+    # longer listed here and doctor flags it as ignored.
+    "HERMES_TOOL_PROGRESS_MODE",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_HOME_CHANNEL_NAME", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
@@ -314,6 +316,14 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+    # ACP (Agent Client Protocol) keys — profile-isolable so different
+    # profiles can use different ACP backends without cross-leak.
+    "HERMES_ACP_AUTH_METHOD",
+    "HERMES_ACP_AUTO_APPROVE",
+    "HERMES_COPILOT_ACP_COMMAND",
+    "HERMES_COPILOT_ACP_ARGS",
+    "COPILOT_CLI_PATH",
+    "COPILOT_ACP_BASE_URL",
 })
 import yaml
 
@@ -1157,7 +1167,7 @@ def _is_env_config_key(key: str) -> bool:
     ]
     return (
         key_upper in api_keys
-        or key_upper.endswith(('_API_KEY', '_TOKEN'))
+        or key_upper.endswith(('_API_KEY', '_TOKEN', '_SECRET'))
         or key_upper.startswith('TERMINAL_SSH')
     )
 
@@ -1280,6 +1290,15 @@ def _normalize_custom_provider_entry(
     if not isinstance(entry, dict):
         return None
 
+    # Shallow-copy before the alias normalization below writes into the
+    # entry: callers (get_compatible_custom_providers,
+    # providers_dict_to_custom_providers) pass live sub-dicts from
+    # load_config_readonly()'s shared cache, and mutating those both
+    # violates the cache's no-mutation contract and leaks duplicated
+    # alias keys back into config.yaml through any later
+    # save_config(load_config()) round-trip.
+    entry = dict(entry)
+
     # Accept camelCase aliases commonly used in hand-written configs.
     _CAMEL_ALIASES: Dict[str, str] = {
         "apiKey": "api_key",
@@ -1390,7 +1409,10 @@ def _normalize_custom_provider_entry(
 
     models = entry.get("models")
     if isinstance(models, dict) and models:
-        normalized["models"] = models
+        # Shallow-copy: `entry` may alias a cached config sub-dict, and the
+        # normalized entry escapes into long-lived runtime state
+        # (agent._custom_providers) — don't share the cached models mapping.
+        normalized["models"] = dict(models)
     elif isinstance(models, list) and models:
         # Hand-edited configs (and older Hermes versions) may write
         # ``models`` as a plain list of ids or as ``[{id: ...}]`` rows.
@@ -1664,7 +1686,9 @@ def get_custom_provider_extra_headers(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
-        return normalize_extra_headers(entry.get("extra_headers"))
+        headers = normalize_extra_headers(entry.get("extra_headers"))
+        if headers:
+            return headers
     return {}
 
 
@@ -1767,6 +1791,25 @@ def _coerce_config_version(value: Any) -> int:
     return max(version, 0)
 
 
+def _raw_config_has_explicit_version() -> bool:
+    """True when config.yaml exists, parses, and carries a ``_config_version`` key.
+
+    Distinguishes an ANCIENT config (explicit old version → refused by the
+    v12 support floor) from a fresh minimal/hand-written/cloned config with
+    no version key at all (→ migrated + stamped normally). Missing or
+    unparseable files return False so they never trip the floor gate.
+    """
+    config_path = get_config_path()
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            raw = fast_safe_load(f) or {}
+    except Exception:
+        return False
+    return isinstance(raw, dict) and "_config_version" in raw
+
+
 def check_config_version() -> Tuple[int, int]:
     """
     Check the raw on-disk config schema version.
@@ -1820,6 +1863,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
+    "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
     "session_reset",         # top-level form read by gateway/config.py + setup
     "group_sessions_per_user",   # top-level form bridged by gateway/config.py
     "thread_sessions_per_user",  # top-level form bridged by gateway/config.py
@@ -2126,556 +2170,52 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
     # Check config version
     current_ver, latest_ver = check_config_version()
-    
-    # ── Version 3 → 4: migrate tool progress from .env to config.yaml ──
-    if current_ver < 4:
-        config = read_raw_config()
-        display = config.get("display", {})
-        if not isinstance(display, dict):
-            display = {}
-        if "tool_progress" not in display:
-            old_enabled = get_env_value("HERMES_TOOL_PROGRESS")
-            old_mode = get_env_value("HERMES_TOOL_PROGRESS_MODE")
-            if old_enabled and old_enabled.lower() in {"false", "0", "no"}:
-                display["tool_progress"] = "off"
-                results["config_added"].append("display.tool_progress=off (from HERMES_TOOL_PROGRESS=false)")
-            elif old_mode and old_mode.lower() in {"new", "all", "verbose"}:
-                display["tool_progress"] = old_mode.lower()
-                results["config_added"].append(f"display.tool_progress={old_mode.lower()} (from HERMES_TOOL_PROGRESS_MODE)")
-            else:
-                display["tool_progress"] = "all"
-                results["config_added"].append("display.tool_progress=all (default)")
-            config["display"] = display
-            _persist_migration(config)
-            if not quiet:
-                print(f"  ✓ Migrated tool progress to config.yaml: {display['tool_progress']}")
-    
-    # ── Version 4 → 5: add timezone field ──
-    if current_ver < 5:
-        config = read_raw_config()
-        if "timezone" not in config:
-            old_tz = os.getenv("HERMES_TIMEZONE", "")
-            if old_tz and old_tz.strip():
-                config["timezone"] = old_tz.strip()
-                results["config_added"].append(f"timezone={old_tz.strip()} (from HERMES_TIMEZONE)")
-            else:
-                config["timezone"] = ""
-                results["config_added"].append("timezone= (empty, uses server-local)")
-            _persist_migration(config)
-            if not quiet:
-                tz_display = config["timezone"] or "(server-local)"
-                print(f"  ✓ Added timezone to config.yaml: {tz_display}")
 
-    # ── Version 8 → 9: clear ANTHROPIC_TOKEN from .env ──
-    # The new Anthropic auth flow no longer uses this env var.
-    if current_ver < 9:
-        try:
-            old_token = get_env_value("ANTHROPIC_TOKEN")
-            if old_token:
-                save_env_value("ANTHROPIC_TOKEN", "")
-                if not quiet:
-                    print("  ✓ Cleared ANTHROPIC_TOKEN from .env (no longer used)")
-        except Exception:
-            pass
-
-    # ── Version 11 → 12: migrate custom_providers list → providers dict ──
-    if current_ver < 12:
-        config = read_raw_config()
-        custom_list = config.get("custom_providers")
-        if isinstance(custom_list, list) and custom_list:
-            providers_dict = config.get("providers", {})
-            if not isinstance(providers_dict, dict):
-                providers_dict = {}
-            migrated_count = 0
-            for entry in custom_list:
-                if not isinstance(entry, dict):
-                    continue
-                old_name = entry.get("name", "")
-                old_url = entry.get("base_url", "") or entry.get("url", "") or entry.get("api", "") or ""
-                if not old_url:
-                    continue  # skip entries with no URL
-
-                # Generate a kebab-case key from the display name
-                key = old_name.strip().lower().replace(" ", "-").replace("(", "").replace(")", "")
-                # Remove consecutive hyphens and trailing hyphens
-                while "--" in key:
-                    key = key.replace("--", "-")
-                key = key.strip("-")
-                if not key:
-                    # Fallback: derive from URL hostname
-                    try:
-                        from urllib.parse import urlparse
-                        parsed = urlparse(old_url)
-                        key = (parsed.hostname or "endpoint").replace(".", "-")
-                    except Exception:
-                        key = f"endpoint-{migrated_count}"
-
-                # Don't overwrite existing entries
-                base_key = key
-                suffix = migrated_count
-                while key in providers_dict:
-                    key = f"{base_key}-{suffix}"
-                    suffix += 1
-
-                new_entry = _custom_provider_entry_to_provider_config(
-                    entry,
-                    provider_key=key,
-                )
-                if new_entry is None:
-                    continue
-                if not old_name:
-                    new_entry.pop("name", None)
-                if new_entry.get("api_key") in {"no-key", "no-key-required", ""}:
-                    new_entry.pop("api_key", None)
-
-                providers_dict[key] = new_entry
-                migrated_count += 1
-
-            if migrated_count > 0:
-                config["providers"] = providers_dict
-                # Remove the old list — runtime reads via get_compatible_custom_providers()
-                config.pop("custom_providers", None)
-                _persist_migration(config)
-                if not quiet:
-                    print(f"  ✓ Migrated {migrated_count} custom provider(s) to providers: section")
-                    for key in list(providers_dict.keys())[-migrated_count:]:
-                        ep = providers_dict[key]
-                        print(f"    → {key}: {ep.get('api', '')}")
-
-    # ── Version 12 → 13: clear dead LLM_MODEL / OPENAI_MODEL from .env ──
-    # These env vars were written by the old setup wizard but nothing reads
-    # them anymore (config.yaml is the sole source of truth since March 2026).
-    # Stale entries cause user confusion — see issue report.
-    if current_ver < 13:
-        for dead_var in ("LLM_MODEL", "OPENAI_MODEL"):
-            try:
-                old_val = get_env_value(dead_var)
-                if old_val:
-                    save_env_value(dead_var, "")
-                    if not quiet:
-                        print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
-            except Exception:
-                pass
-
-    # ── Version 13 → 14: migrate legacy flat stt.model to provider section ──
-    # Old configs (and cli-config.yaml.example) had a flat `stt.model` key
-    # that was provider-agnostic.  When the provider was "local" this caused
-    # OpenAI model names (e.g. "whisper-1") to be fed to faster-whisper,
-    # crashing with "Invalid model size".  Move the value into the correct
-    # provider-specific section and remove the flat key.
-    if current_ver < 14:
-        # Read raw config (no defaults merged) to check what the user actually
-        # wrote, then apply changes to the merged config for saving.
-        raw = read_raw_config()
-        raw_stt = raw.get("stt", {})
-        if isinstance(raw_stt, dict) and "model" in raw_stt:
-            legacy_model = raw_stt["model"]
-            provider = raw_stt.get("provider", "local")
-            config = read_raw_config()
-            stt = config.get("stt", {})
-            # Remove the legacy flat key
-            stt.pop("model", None)
-            # Place it in the appropriate provider section only if the
-            # user didn't already set a model there
-            if provider in {"local", "local_command"}:
-                # Don't migrate an OpenAI model name into the local section
-                _local_models = {
-                    "tiny.en", "tiny", "base.en", "base", "small.en", "small",
-                    "medium.en", "medium", "large-v1", "large-v2", "large-v3",
-                    "large", "distil-large-v2", "distil-medium.en",
-                    "distil-small.en", "distil-large-v3", "distil-large-v3.5",
-                    "large-v3-turbo", "turbo",
-                }
-                if legacy_model in _local_models:
-                    # Check raw config — only set if user didn't already
-                    # have a nested local.model
-                    raw_local = raw_stt.get("local", {})
-                    if not isinstance(raw_local, dict) or "model" not in raw_local:
-                        local_cfg = stt.setdefault("local", {})
-                        local_cfg["model"] = legacy_model
-                # else: drop it — it was an OpenAI model name, local section
-                # already defaults to "base" via DEFAULT_CONFIG
-            else:
-                # Cloud provider — put it in that provider's section only
-                # if user didn't already set a nested model
-                raw_provider = raw_stt.get(provider, {})
-                if not isinstance(raw_provider, dict) or "model" not in raw_provider:
-                    provider_cfg = stt.setdefault(provider, {})
-                    provider_cfg["model"] = legacy_model
-            config["stt"] = stt
-            _persist_migration(config)
-            if not quiet:
-                print("  ✓ Migrated legacy stt.model to provider-specific config")
-
-    # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    if current_ver < 15:
-        config = read_raw_config()
-        display = config.get("display", {})
-        if not isinstance(display, dict):
-            display = {}
-        if "interim_assistant_messages" not in display:
-            display["interim_assistant_messages"] = True
-            config["display"] = display
-            results["config_added"].append("display.interim_assistant_messages=true (default)")
-            _persist_migration(config)
-            if not quiet:
-                print("  ✓ Added display.interim_assistant_messages=true")
-
-    # ── Version 15 → 16: migrate tool_progress_overrides into display.platforms ──
-    if current_ver < 16:
-        config = read_raw_config()
-        display = config.get("display", {})
-        if not isinstance(display, dict):
-            display = {}
-        old_overrides = display.get("tool_progress_overrides")
-        if isinstance(old_overrides, dict) and old_overrides:
-            platforms = display.get("platforms", {})
-            if not isinstance(platforms, dict):
-                platforms = {}
-            for plat, mode in old_overrides.items():
-                if plat not in platforms:
-                    platforms[plat] = {}
-                if "tool_progress" not in platforms[plat]:
-                    platforms[plat]["tool_progress"] = mode
-            display["platforms"] = platforms
-            config["display"] = display
-            _persist_migration(config)
-            if not quiet:
-                migrated = ", ".join(f"{p}={m}" for p, m in old_overrides.items())
-                print(f"  ✓ Migrated tool_progress_overrides → display.platforms: {migrated}")
-            results["config_added"].append("display.platforms (migrated from tool_progress_overrides)")
-
-    # ── Version 16 → 17: remove legacy compression.summary_* keys ──
-    if current_ver < 17:
-        config = read_raw_config()
-        comp = config.get("compression", {})
-        if isinstance(comp, dict):
-            s_model = comp.pop("summary_model", None)
-            s_provider = comp.pop("summary_provider", None)
-            s_base_url = comp.pop("summary_base_url", None)
-            migrated_keys = []
-            # Migrate non-empty, non-default values to auxiliary.compression
-            if s_model and str(s_model).strip():
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("model"):
-                    aux_comp["model"] = str(s_model).strip()
-                    migrated_keys.append(f"model={s_model}")
-            if s_provider and str(s_provider).strip() not in {"", "auto"}:
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("provider") or aux_comp.get("provider") == "auto":
-                    aux_comp["provider"] = str(s_provider).strip()
-                    migrated_keys.append(f"provider={s_provider}")
-            if s_base_url and str(s_base_url).strip():
-                aux = config.setdefault("auxiliary", {})
-                aux_comp = aux.setdefault("compression", {})
-                if not aux_comp.get("base_url"):
-                    aux_comp["base_url"] = str(s_base_url).strip()
-                    migrated_keys.append(f"base_url={s_base_url}")
-            if migrated_keys or s_model is not None or s_provider is not None or s_base_url is not None:
-                config["compression"] = comp
-                _persist_migration(config)
-                if not quiet:
-                    if migrated_keys:
-                        print(f"  ✓ Migrated compression.summary_* → auxiliary.compression: {', '.join(migrated_keys)}")
-                    else:
-                        print("  ✓ Removed unused compression.summary_* keys")
-
-    # ── Version 20 → 21: plugins are now opt-in; grandfather existing user plugins ──
-    # The loader now requires plugins to appear in ``plugins.enabled`` before
-    # loading. Existing installs had all discovered plugins loading by default
-    # (minus anything in ``plugins.disabled``). To avoid silently breaking
-    # those setups on upgrade, populate ``plugins.enabled`` with the set of
-    # currently-installed user plugins that aren't already disabled.
+    # ── Auto-migration support floor (policy: v12, July 2026) ──
+    # A config with an EXPLICIT on-disk ``_config_version`` below the floor is
+    # NOT auto-migrated and NOT rewritten: we surface a clear, actionable
+    # message and leave the file byte-for-byte untouched. This matches the
+    # fail-safe posture for unparseable configs (warn on stderr, continue —
+    # load_config() deep-merges defaults at read time), so the CLI never
+    # crashes on an ancient config. The floor gate lives here in the wrapper
+    # (not in run_migrations) so the registry driver stays a pure mechanism
+    # that tests can exercise directly.
     #
-    # Bundled plugins (shipped in the repo itself) are NOT grandfathered —
-    # they ship off for everyone, including existing users, so any user who
-    # wants one has to opt in explicitly.
-    if current_ver < 21:
-        config = read_raw_config()
-        plugins_cfg = config.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            plugins_cfg = {}
-        # Only migrate if the enabled allow-list hasn't been set yet.
-        if "enabled" not in plugins_cfg:
-            disabled = plugins_cfg.get("disabled", []) or []
-            if not isinstance(disabled, list):
-                disabled = []
-            disabled_set = set(disabled)
+    # A config with NO ``_config_version`` key at all is NOT floor-refused:
+    # that shape is a fresh minimal config (profile clones write bare keys;
+    # users hand-write two-line configs), not an ancient install. Those get
+    # the normal ladder (the retired <12 steps were no-ops for configs
+    # lacking the legacy keys they migrated) and a fresh version stamp —
+    # the historical behavior.
+    from hermes_cli.config_migrations import (
+        SUPPORT_FLOOR_VERSION,
+        run_migrations,
+        support_floor_message,
+    )
 
-            # Scan ``$HERMES_HOME/plugins/`` for currently installed user plugins.
-            grandfathered: List[str] = []
-            try:
-                user_plugins_dir = get_hermes_home() / "plugins"
-                if user_plugins_dir.is_dir():
-                    for child in sorted(user_plugins_dir.iterdir()):
-                        if not child.is_dir():
-                            continue
-                        manifest_file = child / "plugin.yaml"
-                        if not manifest_file.exists():
-                            manifest_file = child / "plugin.yml"
-                        if not manifest_file.exists():
-                            continue
-                        try:
-                            with open(manifest_file, encoding="utf-8") as _mf:
-                                manifest = fast_safe_load(_mf) or {}
-                        except Exception:
-                            manifest = {}
-                        name = manifest.get("name") or child.name
-                        if name in disabled_set:
-                            continue
-                        grandfathered.append(name)
-            except Exception:
-                grandfathered = []
-
-            plugins_cfg["enabled"] = grandfathered
-            config["plugins"] = plugins_cfg
-            _persist_migration(config)
-            results["config_added"].append(
-                f"plugins.enabled (opt-in allow-list, {len(grandfathered)} grandfathered)"
-            )
-            if not quiet:
-                if grandfathered:
-                    print(
-                        f"  ✓ Plugins now opt-in: grandfathered "
-                        f"{len(grandfathered)} existing plugin(s) into plugins.enabled"
-                    )
-                else:
-                    print(
-                        "  ✓ Plugins now opt-in: no existing plugins to grandfather. "
-                        "Use `hermes plugins enable <name>` to activate."
-                    )
-
-    # ── Version 22 → 23: seed curator defaults + create logs/curator/ ──
-    # The curator (background skill maintenance) was added in PR #16049, but
-    # existing configs from before that PR (or before the April 2026
-    # unification under `auxiliary.curator`) never wrote the curator section
-    # to disk. The runtime deep-merge in `load_config()` fills defaults at
-    # read time, so the curator *functions*; but users can't see/edit the
-    # settings in their `config.yaml`, and `hermes curator status` has no
-    # stable logs dir to point at until the first run mkdir's it.
-    #
-    # This migration:
-    #   1. Writes the `curator` top-level section to config.yaml (enabled,
-    #      interval_hours, min_idle_hours, stale_after_days, archive_after_days)
-    #      — only keys the user hasn't already overridden.
-    #   2. Writes the `auxiliary.curator` aux-task slot (provider, model,
-    #      base_url, api_key, timeout, extra_body) — canonical slot for
-    #      routing the curator fork to a cheaper aux model.
-    #   3. Creates `~/.hermes/logs/curator/` if missing (belt-and-suspenders
-    #      on top of ensure_hermes_home() — old profiles that predate this
-    #      migration still benefit).
-    if current_ver < 23:
-        try:
-            curator_dir = get_hermes_home() / "logs" / "curator"
-            curator_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            results["warnings"].append(f"Could not create {curator_dir}: {e}")
-
-        config = read_raw_config()
-        touched = False
-
-        # (1) Top-level curator section — only add missing keys
-        _curator_defaults = DEFAULT_CONFIG.get("curator", {})
-        raw_curator = config.get("curator")
-        if not isinstance(raw_curator, dict):
-            raw_curator = {}
-        added_curator: List[str] = []
-        for k, v in _curator_defaults.items():
-            if k not in raw_curator:
-                raw_curator[k] = copy.deepcopy(v)
-                added_curator.append(k)
-        if added_curator:
-            config["curator"] = raw_curator
-            touched = True
-
-        # (2) auxiliary.curator task slot
-        _aux_curator_defaults = (
-            DEFAULT_CONFIG.get("auxiliary", {}).get("curator", {})
-        )
-        raw_aux = config.get("auxiliary")
-        if not isinstance(raw_aux, dict):
-            raw_aux = {}
-        raw_aux_curator = raw_aux.get("curator")
-        if not isinstance(raw_aux_curator, dict):
-            raw_aux_curator = {}
-        added_aux: List[str] = []
-        for k, v in _aux_curator_defaults.items():
-            if k not in raw_aux_curator:
-                raw_aux_curator[k] = copy.deepcopy(v)
-                added_aux.append(k)
-        if added_aux:
-            raw_aux["curator"] = raw_aux_curator
-            config["auxiliary"] = raw_aux
-            touched = True
-
-        if touched:
-            _persist_migration(config)
-            if added_curator:
-                results["config_added"].append(
-                    f"curator ({len(added_curator)} default key(s))"
-                )
-                if not quiet:
-                    print(
-                        "  ✓ Curator settings now available "
-                        f"({', '.join(added_curator)}) — edit via `hermes config set`"
-                    )
-            if added_aux:
-                results["config_added"].append(
-                    f"auxiliary.curator ({len(added_aux)} default key(s))"
-                )
-                if not quiet:
-                    print(
-                        "  ✓ auxiliary.curator settings now available "
-                        f"({', '.join(added_aux)}) — edit via `hermes config set`"
-                    )
-
-    # ── Version 24 → 25: lower model_catalog TTL 24h → 1h ──
-    # The model picker now refreshes its curated list hourly so freshly
-    # published model-catalog.json deploys reach users without a day-long
-    # stale window. Only rewrite the OLD default (24) — never clobber a
-    # value the user deliberately customized.
-    if current_ver < 25:
-        config = read_raw_config()
-        raw_mc = config.get("model_catalog")
-        if isinstance(raw_mc, dict) and raw_mc.get("ttl_hours") == 24:
-            raw_mc["ttl_hours"] = 1
-            config["model_catalog"] = raw_mc
-            _persist_migration(config)
-            results["config_added"].append("model_catalog.ttl_hours 24→1")
-            if not quiet:
-                print("  ✓ Lowered model_catalog.ttl_hours to 1 (hourly picker refresh)")
-
-    # ── Version 28 → 29: rename memory/skills write_mode → write_approval ──
-    # The tri-state write_mode (on|off|approve) was replaced by a clear boolean
-    # write_approval (default false = gate off, writes flow freely; true =
-    # require approval). Only an explicit "approve" carried gating intent, so
-    # it maps to true; everything else (on/off/unset) → false. The old
-    # "off = block all writes" mode is dropped — memory_enabled: false disables
-    # memory entirely. Only rewrite a key the user actually persisted; never
-    # invent one.
-    if current_ver < 29:
-        config = read_raw_config()
-        touched = False
-        for subsystem in ("memory", "skills"):
-            sub = config.get(subsystem)
-            if not isinstance(sub, dict) or "write_mode" not in sub:
-                continue
-            old = sub.pop("write_mode")
-            old_norm = old.strip().lower() if isinstance(old, str) else old
-            sub["write_approval"] = (old_norm == "approve")
-            config[subsystem] = sub
-            touched = True
-            results["config_added"].append(
-                f"{subsystem}.write_mode → write_approval={sub['write_approval']}"
-            )
-        if touched:
-            _persist_migration(config)
-            if not quiet:
-                print("  ✓ Renamed write_mode → write_approval (boolean gate)")
-
-    # ── Version 29 → 30: curator.consolidate defaults to false ──
-    # Consolidation (the LLM umbrella-building fork) is opt-in, OFF by default;
-    # the deterministic inactivity prune still runs whenever the curator is
-    # enabled. No write is needed: the schema default (curator.consolidate=false)
-    # is supplied by load_config()'s deep-merge at read time, and persisting a
-    # default-valued key would only bloat a lean config (it gets stripped on
-    # save anyway). Existing installs that WANT the old always-consolidate
-    # behavior set it to true explicitly via `hermes config set`.
-
-    # ── Version 30 → 31: switch verify_on_stop OFF (one-time) ──
-    # verify_on_stop defaulted to the "auto" sentinel (surface-aware: on for
-    # interactive coding surfaces). In practice the verification narrative was
-    # more noise than signal — it even fired on doc/markdown/skill edits with
-    # nothing to verify. The new default is OFF. This migration switches
-    # existing installs off ONCE, but only when the user never expressed an
-    # explicit preference: we rewrite the value only if it's missing or still
-    # the "auto" sentinel. An explicit true/false the user set is preserved.
-    if current_ver < 31:
-        config = read_raw_config()
-        raw_agent = config.get("agent")
-        if not isinstance(raw_agent, dict):
-            raw_agent = {}
-        cur = raw_agent.get("verify_on_stop")
-        is_auto_sentinel = (
-            isinstance(cur, str) and cur.strip().lower() == "auto"
-        )
-        # Only flip the non-committal states; leave explicit bool/on/off alone.
-        if cur is None or is_auto_sentinel:
-            raw_agent["verify_on_stop"] = False
-            config["agent"] = raw_agent
-            _persist_migration(config)
-            results["config_added"].append("agent.verify_on_stop=false")
-            if not quiet:
-                print(
-                    "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false). "
-                    "Set it to true to re-enable, or \"auto\" for the legacy "
-                    "surface-aware behavior."
-                )
-
-    # ── Version 31 → 32: flip the BAKED-IN literal true to OFF (one-time) ──
-    # The v30→v31 flip above only caught missing/"auto" values. But the very
-    # first ship of verify-on-stop (config v30, commit 2f1a47b90) defaulted
-    # DEFAULT_CONFIG["agent"]["verify_on_stop"] to a literal True, and
-    # migrate_config persists defaults with strip_defaults=False — so every
-    # install that updated through v30 got `verify_on_stop: true` written into
-    # config.yaml as a literal. v31's guard deliberately preserves an explicit
-    # bool, so it skipped that whole population and left them ON. That literal
-    # true was never a user choice: the feature had no off-switch worth setting
-    # it against until v31 introduced one, so a true persisted before v32 is
-    # always the old machine default. Flip it off once here. A true the user
-    # sets AFTER v32 (config already at version 32) is never touched.
-    if current_ver < 32:
-        config = read_raw_config()
-        raw_agent = config.get("agent")
-        if isinstance(raw_agent, dict) and raw_agent.get("verify_on_stop") is True:
-            raw_agent["verify_on_stop"] = False
-            config["agent"] = raw_agent
-            _persist_migration(config)
-            results["config_added"].append("agent.verify_on_stop=false")
-            if not quiet:
-                print(
-                    "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false) — "
-                    "the old default was written into your config as a literal "
-                    "true. Set it to true again to re-enable, or \"auto\" for the "
-                    "legacy surface-aware behavior."
-                )
-
-    # ── Version 32 → 33: unify delegation concurrency caps ──
-    # delegation.max_async_children is deprecated: max_concurrent_children now
-    # caps both a single batch's parallelism and concurrent background
-    # delegation units. Fold a raised max_async_children into
-    # max_concurrent_children (take the max so nobody loses headroom), then
-    # drop the stale key.
-    if current_ver < 33:
-        config = read_raw_config()
-        raw_deleg = config.get("delegation")
-        if isinstance(raw_deleg, dict) and "max_async_children" in raw_deleg:
-            old_async = raw_deleg.pop("max_async_children")
-            try:
-                old_async_i = int(old_async)
-            except (TypeError, ValueError):
-                old_async_i = None
-            if old_async_i is not None and old_async_i > 3:
-                try:
-                    cur_children = int(raw_deleg.get("max_concurrent_children", 3))
-                except (TypeError, ValueError):
-                    cur_children = 3
-                if old_async_i > cur_children:
-                    raw_deleg["max_concurrent_children"] = old_async_i
-                    results["config_added"].append(
-                        f"delegation.max_concurrent_children={old_async_i} "
-                        f"(folded from deprecated max_async_children)"
-                    )
-            config["delegation"] = raw_deleg
-            _persist_migration(config)
-            if not quiet:
-                print(
-                    "  ✓ Removed deprecated delegation.max_async_children — "
-                    "delegation.max_concurrent_children now caps background "
-                    "delegations too."
-                )
+    _explicit_version = _raw_config_has_explicit_version()
+    floor_refused = (
+        _explicit_version
+        and current_ver < SUPPORT_FLOOR_VERSION
+        and current_ver < latest_ver
+    )
+    if floor_refused:
+        msg = support_floor_message()
+        results["warnings"].append(msg)
+        # stderr so it is visible even on quiet startup paths, matching the
+        # corrupt-config warning posture in _warn_config_parse_failure().
+        sys.stderr.write(f"⚠ hermes config: {msg}\n")
+        if not quiet:
+            print(f"  ⚠ {msg}")
+    else:
+        # ── Versioned migration ladder (table-driven) ──
+        # The per-version steps live in hermes_cli.config_migrations as a
+        # (target_version, fn) registry; the driver applies every step whose
+        # target exceeds current_ver, in strict ascending order, preserving the
+        # original sequential if-block semantics byte-for-byte. Imported lazily
+        # to avoid a module-level import cycle (the steps call back into this
+        # module for read_raw_config/_persist_migration/etc. at call time).
+        run_migrations(current_ver, results, quiet)
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a
@@ -2729,7 +2269,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         # best-effort; never block migration on validation
         logger.debug("platform_toolsets validation skipped: %s", _ts_val_err)
 
-    if current_ver < latest_ver and not quiet:
+    if current_ver < latest_ver and not quiet and not floor_refused:
         print(f"Config version: {current_ver} → {latest_ver}")
 
     # Check for missing required env vars
@@ -2822,7 +2362,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     if missing_config:
         results["config_added"].extend(field["key"] for field in missing_config)
 
-    if current_ver < latest_ver:
+    if current_ver < latest_ver and not floor_refused:
         config = read_raw_config()
         config["_config_version"] = latest_ver
         _persist_migration(config)
@@ -3428,6 +2968,100 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read a user ``config.yaml`` EXACTLY as written on disk.
+
+    No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
+    expansion, no migration, no root-model normalization, no caching.
+
+    ONLY legal for write-back round-trips and raw-file diagnostics —
+    behavioral reads must use load_config()/load_config_readonly().
+
+    Legal call sites, exhaustively:
+
+      * WRITE-BACK ROUND-TRIPS (read → mutate one key → save): merging
+        defaults or the managed overlay here would persist hundreds of
+        default keys (or administrator-pinned values) into the user's file
+        on the next save. Raw is *correct*, not an optimization.
+      * RAW-FILE DIAGNOSTICS (doctor, deprecation sweeps): these inspect
+        what the user actually wrote — stale root keys, drift against .env —
+        and merged defaults would produce false positives.
+      * PRESENCE-SENSITIVE ENV BRIDGES (gateway/send bridges that only
+        export a key when the user explicitly set it): a defaults merge
+        would make every key "present" and bridge the entire DEFAULT_CONFIG
+        into the environment. These sites must still apply
+        ``managed_scope.apply_managed_overlay`` + ``_expand_env_vars``
+        inline, which they do.
+
+    Semantics (deliberately mirrors the bare ``open()+yaml.safe_load()``
+    pattern this replaces, so migrated sites keep their exact failure
+    behavior):
+
+      * missing file → ``{}``
+      * unparseable YAML / other I/O errors → raises (callers that want
+        fail-open already wrap in try/except; callers with last-known-good
+        or warn semantics rely on the exception)
+      * non-dict YAML root → ``{}``
+
+    ``config_path`` defaults to :func:`get_config_path` (profile-aware).
+    Pass an explicit path when the caller resolves its own home (gateway
+    ``_hermes_home``, tui profile override, multi-profile probes).
+    """
+    if config_path is None:
+        config_path = get_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = fast_safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_raw_config_readonly() -> Dict[str, Any]:
+    """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
+
+    Returns the cached raw-config dict directly, skipping the per-call
+    ``copy.deepcopy`` that ``read_raw_config()`` performs (needed there
+    because some callers mutate the result before ``save_config``).
+
+    **Mutating the returned dict corrupts the in-process cache for every
+    subsequent caller.** Only use on read-only paths — e.g. per-turn policy
+    checks like the shared-metrics gate, which runs 2-3x per agent turn and
+    was paying a full config deepcopy each time.
+
+    Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
+    config.yaml is picked up on the next call.
+    """
+    with _CONFIG_LOCK:
+        try:
+            config_path = get_config_path()
+            st = config_path.stat()
+            cache_key = (st.st_mtime_ns, st.st_size)
+        except (FileNotFoundError, OSError):
+            return {}
+
+        path_key = str(config_path)
+        cached = _RAW_CONFIG_CACHE.get(path_key)
+        if cached is not None and cached[:2] == cache_key:
+            return cached[2]
+
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+        except Exception as e:
+            _warn_config_parse_failure(config_path, e)
+            return {}
+
+        if not isinstance(data, dict):
+            data = {}
+        # Store and return THE SAME object (identity invariant): the first
+        # caller must see the exact dict later cache hits return, so a test
+        # asserting ``ro1 is ro2`` holds from the very first call.
+        cached_copy = copy.deepcopy(data)
+        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
+        return cached_copy
+
+
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
     """Refuse to replace an existing config.yaml that cannot be read."""
     if config_path is None:
@@ -3557,6 +3191,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+    "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -3570,6 +3205,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
     "docker_network": "TERMINAL_DOCKER_NETWORK",
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+    "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
@@ -3605,20 +3241,29 @@ def apply_terminal_config_to_env(
     gives those child-process launch paths the same config bridge as classic
     CLI without importing ``cli.py`` and paying for its startup side effects.
 
-    When the user config contains a ``terminal`` section, config.yaml is
-    authoritative and overrides existing env values.  Otherwise defaults only
-    backfill missing env vars so exported/.env values keep working.
+    Explicit keys in the user config's ``terminal`` section are authoritative
+    and override their matching env values.  Merged defaults only backfill
+    missing env vars; they never replace unrelated exported/.env values.
     """
     target = os.environ if env is None else env
 
     raw_config = read_raw_config()
-    file_has_terminal_config = isinstance(raw_config.get("terminal"), dict)
+    raw_terminal_cfg = raw_config.get("terminal")
+    file_has_terminal_config = isinstance(raw_terminal_cfg, dict)
+    if not file_has_terminal_config:
+        raw_terminal_cfg = {}
     should_override = file_has_terminal_config if override is None else override
 
     cfg = config if config is not None else load_config_readonly()
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
+
+    # A caller-supplied config is its own source of explicit keys.  For the
+    # normal merged-config path, only keys present in raw config.yaml may
+    # override existing env values; keys inherited from DEFAULT_CONFIG are
+    # backfill-only.
+    explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
@@ -3630,7 +3275,7 @@ def apply_terminal_config_to_env(
                 continue
             if isinstance(value, str):
                 value = os.path.expanduser(value)
-        if should_override or env_var not in target:
+        if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
 
@@ -4462,10 +4107,36 @@ def reload_env() -> int:
 
 
 def get_env_value(key: str) -> Optional[str]:
-    """Get a value from ~/.hermes/.env or environment."""
-    # Check environment first
-    if key in os.environ:
-        return os.environ[key]
+    """Get a value from ``os.environ`` or ``~/.hermes/.env``, scope-aware.
+
+    The ``os.environ`` read routes through ``agent.secret_scope.get_secret``
+    so that, under an active profile scope (multiplexed gateway turn), this
+    is scope-checked rather than leaking another profile's raw ``os.environ``
+    value. ``get_secret`` encodes the whole policy: global vars pass through;
+    scope is authoritative under multiplexing (miss -> None, no environ
+    fallthrough); when multiplexing is off it behaves exactly like the
+    legacy ``os.environ`` read. Its siblings ``get_env_value_prefer_dotenv``
+    and ``gateway.config._getenv`` already work this way — this was the last
+    scope-blind reader of the trio (#67027).
+    """
+    try:
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            get_secret as _get_secret,
+        )
+    except Exception:
+        if key in os.environ:
+            return os.environ[key]
+        return load_env().get(key)
+
+    try:
+        val = _get_secret(key)
+    except UnscopedSecretError:
+        raise
+    except Exception:
+        val = os.environ.get(key)
+    if val is not None:
+        return val
 
     # Then check .env file
     env_vars = load_env()
@@ -4691,6 +4362,9 @@ def show_config():
         print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
+    elif terminal.get('backend') == 'vercel_sandbox':
+        print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
+        print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
@@ -5153,8 +4827,12 @@ def set_config_value(key: str, value: str, force: bool = False):
         key: Dotted config path (e.g. ``terminal.backend``).
         value: String value (auto-coerced to bool/int/float when matching).
         force: When True, skip the unknown-key warning — useful for scripted
-            writes of keys the running version doesn't recognize yet. The CLI
-            exposes this via ``hermes config set --force``.
+            writes of keys the running version doesn't recognize yet — AND
+            authorize destructive replacement of a mapping section by a
+            scalar (e.g. ``--force model gpt-x`` replaces the whole ``model:``
+            mapping). Without --force, scalar writes over mapping sections are
+            refused (bare ``model`` is redirected to ``model.default``). The
+            CLI exposes this via ``hermes config set --force``.
     """
     if is_managed():
         managed_error("set configuration values")
@@ -5204,8 +4882,15 @@ def set_config_value(key: str, value: str, force: bool = False):
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+        except Exception as exc:
+            print(
+                f"✗ Cannot parse {config_path}: {exc}\n"
+                f"  The file contains a YAML syntax error. Fix the error\n"
+                f"  in your config file first, then retry.\n"
+                f"  (hermes config edit will open it in your editor.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -5227,6 +4912,73 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+    # Normalize a scalar ``model`` key before writing sub-keys so that
+    # ``hermes config set model.provider openai`` doesn't silently
+    # destroy the model id when ``model`` is a bare string shorthand
+    # (e.g. ``model: gpt-4o``).  Without this _set_nested replaces the
+    # scalar with an empty dict, dropping the model id permanently.
+    _model_key = key.strip().lower()
+    if _model_key.startswith("model."):
+        _model_val = user_config.get("model")
+        if isinstance(_model_val, str) and _model_val:
+            user_config["model"] = {"default": _model_val}
+    # Guard against #74995: a single-segment key that names an existing
+    # mapping would silently overwrite the entire section with a scalar
+    # (e.g. ``hermes config set model gpt-5.6-sol`` when model already
+    # contains default/provider/context_length).  Bare ``model`` is a
+    # documented shorthand — redirect to ``model.default`` and preserve
+    # siblings.  All other mapping sections are rejected unless --force.
+    if "." not in key:
+        _existing = user_config.get(key)
+        if isinstance(_existing, dict):
+            if key == "model":
+                if force:
+                    # --force: allow destructive section overwrite.
+                    print(
+                        f"⚠ Replacing entire 'model' section with a scalar "
+                        f"(discarding {len(_existing)} existing sub-key(s))"
+                    )
+                else:
+                    # Redirect bare-model shorthand to model.default while
+                    # keeping every sibling mapping key intact.
+                    key = "model.default"
+                    print(
+                        f"✓ Redirecting bare 'model' to 'model.default' "
+                        f"(preserving {len(_existing)} existing model sub-key(s))"
+                    )
+                    # value was already coerced above; proceed to _set_nested
+            elif not force:
+                _sub = [k for k in _existing if isinstance(k, str)]
+                print(
+                    f"✗ Cannot set '{key}' to a scalar — '{key}' is a "
+                    f"configuration section with {len(_sub)} sub-key(s).",
+                    file=sys.stderr,
+                )
+                if _sub:
+                    _sub_list = ", ".join(_sub[:8])
+                    print(f"  Sub-keys: {_sub_list}", file=sys.stderr)
+                    if len(_sub) > 8:
+                        print(
+                            f"  ... and {len(_sub) - 8} more",
+                            file=sys.stderr,
+                        )
+                print(
+                    "  Use a dotted path to set a specific leaf key:",
+                    file=sys.stderr,
+                )
+                print(
+                    f"    hermes config set {key}.<sub-key> <value>",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Or use --force to replace the entire section:",
+                    file=sys.stderr,
+                )
+                print(
+                    f"    hermes config set --force {key} {value!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
@@ -5345,8 +5097,15 @@ def unset_config_value(key: str):
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+        except Exception as exc:
+            print(
+                f"✗ Cannot parse {config_path}: {exc}\n"
+                f"  The file contains a YAML syntax error. Fix the error\n"
+                f"  in your config file first, then retry.\n"
+                f"  (hermes config edit will open it in your editor.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     removed = _unset_nested(user_config, key)
 
@@ -5403,7 +5162,8 @@ def config_command(args):
             print("  hermes config set terminal.backend docker")
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             print()
-            print("  --force: skip the unknown-key notice for unrecognized keys")
+            print("  --force: skip the unknown-key notice for unrecognized keys,")
+            print("           and allow a scalar to replace a whole mapping section")
             sys.exit(1)
         set_config_value(key, value, force=force)
 

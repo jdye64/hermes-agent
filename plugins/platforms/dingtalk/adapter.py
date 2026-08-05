@@ -95,13 +95,37 @@ except Exception:
     tea_util_models = None
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
 )
+
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +190,7 @@ def check_dingtalk_requirements() -> bool:
         httpx = _httpx
         DINGTALK_STREAM_AVAILABLE = True
         HTTPX_AVAILABLE = True
-    if not os.getenv("DINGTALK_CLIENT_ID") or not os.getenv("DINGTALK_CLIENT_SECRET"):
+    if not os.getenv("DINGTALK_CLIENT_ID") or not _get_scoped_secret("DINGTALK_CLIENT_SECRET"):
         return False
     return True
 
@@ -213,7 +237,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._client_id: str = extra.get("client_id") or os.getenv(
             "DINGTALK_CLIENT_ID", ""
         )
-        self._client_secret: str = extra.get("client_secret") or os.getenv(
+        self._client_secret: str = extra.get("client_secret") or _get_scoped_secret(
             "DINGTALK_CLIENT_SECRET", ""
         )
 
@@ -459,28 +483,18 @@ class DingTalkAdapter(BasePlatformAdapter):
                 patterns = loaded
 
         if patterns is None:
-            return []
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if not isinstance(patterns, list):
-            logger.warning(
-                "[%s] dingtalk mention_patterns must be a list or string; got %s",
-                self.name,
-                type(patterns).__name__,
-            )
+            # Parity with the historical inline implementation: return before
+            # evaluating ``self.name`` (avoids touching adapter attributes on
+            # the no-patterns path).
             return []
 
-        compiled: List[re.Pattern] = []
-        for pattern in patterns:
-            if not isinstance(pattern, str) or not pattern.strip():
-                continue
-            try:
-                compiled.append(re.compile(pattern, re.IGNORECASE))
-            except re.error as exc:
-                logger.warning("[%s] Invalid DingTalk mention pattern %r: %s", self.name, pattern, exc)
-        if compiled:
-            logger.info("[%s] Loaded %d DingTalk mention pattern(s)", self.name, len(compiled))
-        return compiled
+        return compile_mention_patterns(
+            patterns,
+            log_prefix=self.name,
+            platform_label="dingtalk",
+            display_label="DingTalk",
+            logger_=logger,
+        )
 
     def _load_allowed_users(self) -> Set[str]:
         """Load allowed-users list from config.extra or env var.
@@ -1852,7 +1866,7 @@ def _is_connected(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     return bool(
         (extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
-        and (extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
+        and (extra.get("client_secret") or _get_scoped_secret("DINGTALK_CLIENT_SECRET"))
     )
 
 
