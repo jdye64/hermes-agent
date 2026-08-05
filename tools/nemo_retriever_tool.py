@@ -27,7 +27,7 @@ Exa / Firecrawl / Parallel web-search backends.
 
 SDK reference: https://github.com/NVIDIA/NeMo-Retriever (the ``nemo-retriever``
 PyPI package). Ingestion uses ``create_ingestor(...).files(...).extract()``
-``.embed().vdb_upload()``; querying uses
+``.embed().vdb_upload(vdb_op="lancedb", vdb_kwargs=...)``; querying uses
 ``nemo_retriever.retriever.Retriever(...).query(...)``. BM25 is the LanceDB
 full-text component of hybrid retrieval (BM25 FTS + dense, fused with RRF).
 """
@@ -193,15 +193,22 @@ def _ensure_sdk() -> None:
 
 
 def _ingest_documents(files: List[str], uri: Path, table_name: str, cfg: dict) -> None:
-    """Ingest ``files`` into a LanceDB table with BM25/hybrid retrieval enabled."""
+    """Ingest ``files`` into a LanceDB table with BM25/hybrid retrieval enabled.
+
+    GraphIngestor's ``VdbUploadParams.vdb_op`` is a *string* backend id
+    (``"lancedb"``), not a ``LanceDB`` instance — passing an instance gets
+    stringified and fails ``get_vdb_op_cls`` with ``Invalid vdb_op: <LanceDB...>``.
+    Table location goes in ``vdb_kwargs``.
+    """
     from nemo_retriever import create_ingestor  # type: ignore
-    from nemo_retriever.vdb.lancedb import LanceDB  # type: ignore
 
     uri.mkdir(parents=True, exist_ok=True)
-    hybrid = bool(cfg.get("hybrid", True))
-    vdb = LanceDB(uri=str(uri), table_name=table_name, hybrid=hybrid)
+    # FTS index is only useful if query-time hybrid works. On the pinned
+    # nemo-retriever 26.5.0 it does not (see ``_query_index``), so default
+    # ingest to dense-only unless/until the SDK supports hybrid query.
+    hybrid = _query_hybrid_enabled(cfg)
 
-    ingestor = create_ingestor(run_mode="batch")
+    ingestor = create_ingestor(run_mode="inprocess")
     ingestor = ingestor.files(files)
 
     extract_method = str(cfg.get("extract_method") or "").strip()
@@ -215,18 +222,44 @@ def _ingest_documents(files: List[str], uri: Path, table_name: str, cfg: dict) -
         embed_invoke_url=str(cfg.get("embedding_endpoint") or DEFAULT_EMBEDDING_ENDPOINT),
         embed_modality="text",
     )
-    ingestor = ingestor.vdb_upload(vdb_op=vdb)
+    # vdb_op must be the backend name string; kwargs configure LanceDB.
+    ingestor = ingestor.vdb_upload(
+        vdb_op="lancedb",
+        vdb_kwargs={
+            "uri": str(uri),
+            "table_name": table_name,
+            "hybrid": hybrid,
+        },
+    )
     ingestor.ingest()
 
 
+def _query_hybrid_enabled(cfg: dict) -> bool:
+    """Whether to request LanceDB hybrid (BM25 + dense) at query time.
+
+    ``nemo-retriever==26.5.0`` (our lazy pin) embeds the query then calls
+    ``LanceDB.retrieval(vectors, ...)``. That path raises
+    ``NotImplementedError: LanceDB hybrid retrieval with precomputed vectors
+    is not implemented yet`` when ``hybrid=True``. Newer SDK mainline adds
+    hybrid+``query_texts`` support; until we bump the pin, force dense-only
+    so ``document_search`` works. Respect ``hybrid: false`` explicitly;
+    ``hybrid: true`` is accepted but currently coerced to dense.
+    """
+    # Keep the config knob, but do not enable hybrid against the broken pin.
+    if not bool(cfg.get("hybrid", False)):
+        return False
+    return False  # flip when lazy_deps pin gains working hybrid query
+
+
 def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) -> List[dict]:
-    """Run a BM25/hybrid retrieval query against an existing LanceDB table."""
+    """Run dense (or hybrid, when supported) retrieval against an existing LanceDB table."""
     from nemo_retriever.retriever import Retriever  # type: ignore
 
+    hybrid = _query_hybrid_enabled(cfg)
     vdb_kwargs: Dict[str, Any] = {
         "uri": str(uri),
         "table_name": table_name,
-        "hybrid": bool(cfg.get("hybrid", True)),
+        "hybrid": hybrid,
     }
     embed_model = str(cfg.get("embedding_model") or DEFAULT_EMBEDDING_MODEL)
     retriever = Retriever(
@@ -239,7 +272,31 @@ def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) 
         top_k=top_k,
         rerank=bool(cfg.get("rerank", False)),
     )
-    hits = retriever.query(query)
+    try:
+        hits = retriever.query(query)
+    except NotImplementedError as exc:
+        # Defensive: if a future pin partially enables hybrid but still hits
+        # this path, fall back to dense rather than failing the tool.
+        if not hybrid:
+            raise
+        logger.warning(
+            "NeMo Retriever hybrid query unsupported (%s); retrying with dense retrieval",
+            exc,
+        )
+        vdb_kwargs = {**vdb_kwargs, "hybrid": False}
+        retriever = Retriever(
+            vdb_kwargs=vdb_kwargs,
+            embed_kwargs={
+                "model_name": embed_model,
+                "embed_model_name": embed_model,
+                "embedding_endpoint": str(
+                    cfg.get("embedding_endpoint") or DEFAULT_EMBEDDING_ENDPOINT
+                ),
+            },
+            top_k=top_k,
+            rerank=bool(cfg.get("rerank", False)),
+        )
+        hits = retriever.query(query)
     return list(hits or [])
 
 
@@ -372,7 +429,7 @@ def document_search(
     result: Dict[str, Any] = {
         "success": True,
         "backend": "nemo_retriever",
-        "retrieval": "bm25+hybrid" if cfg.get("hybrid", True) else "bm25",
+        "retrieval": "bm25+hybrid" if _query_hybrid_enabled(cfg) else "dense",
         "query": query,
         "index": table_name,
         "indexed_documents": len(files),

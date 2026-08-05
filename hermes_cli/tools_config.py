@@ -105,6 +105,7 @@ CONFIGURABLE_TOOLSETS = [
     ("video_gen",       "🎬 Video Generation",          "video_generate (text/image/reference)"),
     ("bfl",             "🎬 BFL FLUX 3 Video",          "bfl_flux3_*"),
     ("x_search",        "🐦 X (Twitter) Search",        "x_search (requires xAI OAuth or XAI_API_KEY)"),
+    ("document_search", "📚 Document Search",           "document_search (PDF/Word/HTML via NeMo Retriever; needs NVIDIA_API_KEY or local)"),
     ("tts",             "🔊 Text-to-Speech",            "text_to_speech"),
     ("stt",             "🎙️ Speech-to-Text",           "voice transcription (gateway voice messages + voice mode)"),
     ("skills",          "📚 Skills",                    "list, view, manage"),
@@ -153,7 +154,10 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+_DEFAULT_OFF_TOOLSETS = {
+    "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen",
+    "x_search", "document_search", "a2a",
+}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
@@ -745,7 +749,8 @@ TOOL_CATEGORIES = {
 # resolves via `resolve_vision_provider_client()`, so the tuple below is never
 # prompted or read for vision; it's purely a presence marker.
 TOOLSET_ENV_REQUIREMENTS = {
-    "vision":     [("OPENROUTER_API_KEY",   "https://openrouter.ai/keys")],
+    "vision":           [("OPENROUTER_API_KEY", "https://openrouter.ai/keys")],
+    "document_search":  [("NVIDIA_API_KEY",     "https://build.nvidia.com/")],
 }
 
 

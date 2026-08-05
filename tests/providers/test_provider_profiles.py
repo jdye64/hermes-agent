@@ -25,6 +25,30 @@ class TestNvidiaProfile:
         assert "nvidia.com" in p.base_url
 
 
+class TestNvidiaInferenceProfile:
+    def test_discovery(self):
+        p = get_provider_profile("nvidia-inference")
+        assert p is not None
+        assert p.name == "nvidia-inference"
+
+    def test_base_url(self):
+        p = get_provider_profile("nvidia-inference")
+        assert "inference-api.nvidia.com" in p.base_url
+
+    def test_alias_resolves(self):
+        p = get_provider_profile("inference-nvidia")
+        assert p is not None
+        assert p.name == "nvidia-inference"
+
+    def test_max_tokens(self):
+        p = get_provider_profile("nvidia-inference")
+        assert p.default_max_tokens == 16384
+
+    def test_env_vars_prefer_dedicated_key(self):
+        p = get_provider_profile("nvidia-inference")
+        assert p.env_vars[0] == "NVIDIA_INFERENCE_API_KEY"
+
+
 
 class TestKimiProfile:
     def test_temperature_omit(self):

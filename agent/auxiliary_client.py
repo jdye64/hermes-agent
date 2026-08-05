@@ -7871,18 +7871,30 @@ def _build_call_kwargs(
         # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
         # there.
         #
-        # NVIDIA NIM (integrate.api.nvidia.com and local NIM endpoints) is a
-        # second exception: some models—notably minimaxai/minimax-m3—return HTTP
-        # 200 with an empty choices[] payload when max_tokens is omitted. The main
-        # NVIDIA chat path already sends an output cap via the provider profile;
-        # preserve it on the auxiliary path too.
+        # NVIDIA NIM / Inference Hub are a second exception: some models—
+        # notably minimaxai/minimax-m3—return HTTP 200 with an empty choices[]
+        # payload when max_tokens is omitted. The main NVIDIA chat path already
+        # sends an output cap via the provider profile; preserve it on the
+        # auxiliary path too. Covers integrate.api.nvidia.com (NIM),
+        # inference-api.nvidia.com (Inference Hub), and local NIM endpoints.
         _effective_base = base_url or (
             _current_custom_base_url() if provider == "custom" else ""
         )
         _provider_norm = str(provider or "").strip().lower()
         _is_nvidia_nim = (
-            _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
+            _provider_norm in {
+                "nvidia",
+                "nvidia-nim",
+                "nim",
+                "build-nvidia",
+                "nemotron",
+                "nvidia-inference",
+                "nvidia-inference-hub",
+                "inference-nvidia",
+                "inference-hub",
+            }
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
+            or base_url_host_matches(_effective_base, "inference-api.nvidia.com")
         )
         _is_moa = bool(task) and str(task) == "moa_reference"
         # Gemini's native generateContent maps max_tokens → maxOutputTokens and,

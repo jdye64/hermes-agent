@@ -1280,7 +1280,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         or base_url_host_matches(agent._base_url_lower, "githubcopilot.com")
     )
     _is_nous = "nousresearch" in agent._base_url_lower
-    _is_nvidia = "integrate.api.nvidia.com" in agent._base_url_lower
+    _is_nvidia = (
+        "integrate.api.nvidia.com" in agent._base_url_lower
+        or "inference-api.nvidia.com" in agent._base_url_lower
+    )
     _is_kimi = (
         base_url_host_matches(agent.base_url, "api.kimi.com")
         or base_url_host_matches(agent.base_url, "moonshot.ai")

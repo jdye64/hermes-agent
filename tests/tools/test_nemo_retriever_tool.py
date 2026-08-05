@@ -146,7 +146,7 @@ def test_happy_path_envelope(monkeypatch, tmp_path):
 
     assert out["success"] is True
     assert out["backend"] == "nemo_retriever"
-    assert out["retrieval"] == "bm25+hybrid"
+    assert out["retrieval"] == "dense"
     assert out["reindexed"] is True
     assert out["count"] == 2
     assert out["hits"][0]["text"] == "alpha passage"
@@ -179,13 +179,51 @@ def test_top_k_clamped_and_defaulted(monkeypatch, tmp_path):
     assert seen["top_k"] == 50
 
 
-def test_bm25_only_when_hybrid_disabled(monkeypatch, tmp_path):
+def test_dense_retrieval_label_when_hybrid_disabled(monkeypatch, tmp_path):
     _enable(monkeypatch, {"hybrid": False})
     pdf = tmp_path / "a.pdf"
     pdf.write_text("x", encoding="utf-8")
     monkeypatch.setattr(nrt, "_nemo_retriever_search", lambda **k: ([], False))
     out = json.loads(nrt.document_search(query="q", paths=[str(pdf)]))
-    assert out["retrieval"] == "bm25"
+    assert out["retrieval"] == "dense"
+
+
+def test_query_hybrid_forced_off_on_pinned_sdk():
+    """Pinned nemo-retriever 26.5.0 cannot hybrid-query precomputed vectors."""
+    assert nrt._query_hybrid_enabled({"hybrid": True}) is False
+    assert nrt._query_hybrid_enabled({"hybrid": False}) is False
+    assert nrt._query_hybrid_enabled({}) is False
+
+
+def test_query_index_falls_back_to_dense_on_hybrid_not_implemented(monkeypatch, tmp_path):
+    """If hybrid somehow gets enabled and SDK raises, retry dense."""
+    import sys
+    import types
+
+    calls = {"n": 0}
+
+    class _FakeRetriever:
+        def __init__(self, **kwargs):
+            self.vdb_kwargs = kwargs.get("vdb_kwargs") or {}
+
+        def query(self, query):
+            calls["n"] += 1
+            if self.vdb_kwargs.get("hybrid"):
+                raise NotImplementedError(
+                    "LanceDB hybrid retrieval with precomputed vectors is not implemented yet."
+                )
+            return [{"text": "hit", "score": 1.0}]
+
+    monkeypatch.setattr(nrt, "_query_hybrid_enabled", lambda cfg: True)
+    if "nemo_retriever" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "nemo_retriever", types.ModuleType("nemo_retriever"))
+    mod = types.ModuleType("nemo_retriever.retriever")
+    mod.Retriever = _FakeRetriever
+    monkeypatch.setitem(sys.modules, "nemo_retriever.retriever", mod)
+
+    hits = nrt._query_index("coal", tmp_path, "docs_t", 3, {"hybrid": True})
+    assert hits == [{"text": "hit", "score": 1.0}]
+    assert calls["n"] == 2  # hybrid attempt + dense retry
 
 
 def test_sdk_runtime_error_becomes_tool_error(monkeypatch, tmp_path):
@@ -227,6 +265,72 @@ def test_normalize_hit_content_alias():
     h = nrt._normalize_hit({"content": "body", "_relevance_score": 1.5}, max_chars=100)
     assert h["text"] == "body"
     assert h["score"] == 1.5
+
+
+# ---------------------------------------------------------------------------
+# Ingest API contract (nemo-retriever GraphIngestor)
+# ---------------------------------------------------------------------------
+
+def test_ingest_documents_passes_lancedb_string_not_instance(monkeypatch, tmp_path):
+    """GraphIngestor VdbUploadParams.vdb_op must be the backend id string.
+
+    Passing a LanceDB instance as vdb_op gets stringified and fails
+    get_vdb_op_cls with ``Invalid vdb_op: <LanceDB object ...>``.
+    """
+    calls = {}
+
+    create_calls = {}
+
+    class _FakeIngestor:
+        def files(self, files):
+            calls["files"] = files
+            return self
+
+        def extract(self, **kw):
+            return self
+
+        def embed(self, **kw):
+            return self
+
+        def vdb_upload(self, params=None, **kwargs):
+            calls["vdb_upload_params"] = params
+            calls["vdb_upload_kwargs"] = kwargs
+            return self
+
+        def ingest(self):
+            calls["ingest"] = True
+
+    def _fake_create_ingestor(**kw):
+        create_calls.update(kw)
+        return _FakeIngestor()
+
+    monkeypatch.setattr(
+        "nemo_retriever.create_ingestor",
+        _fake_create_ingestor,
+        raising=False,
+    )
+    # Import path used inside _ingest_documents
+    import sys
+    import types
+
+    fake_nr = types.ModuleType("nemo_retriever")
+    fake_nr.create_ingestor = _fake_create_ingestor
+    monkeypatch.setitem(sys.modules, "nemo_retriever", fake_nr)
+
+    pdf = tmp_path / "a.pdf"
+    pdf.write_text("x", encoding="utf-8")
+    uri = tmp_path / "idx"
+    nrt._ingest_documents([str(pdf)], uri, "docs_test", {"hybrid": True})
+
+    assert create_calls.get("run_mode") == "inprocess"
+    assert calls.get("ingest") is True
+    kw = calls.get("vdb_upload_kwargs") or {}
+    assert kw.get("vdb_op") == "lancedb"
+    assert isinstance(kw.get("vdb_op"), str)
+    assert kw.get("vdb_kwargs", {}).get("table_name") == "docs_test"
+    assert kw.get("vdb_kwargs", {}).get("uri") == str(uri)
+    # Pinned SDK cannot hybrid-query; ingest follows the same dense-only flag.
+    assert kw.get("vdb_kwargs", {}).get("hybrid") is False
 
 
 # ---------------------------------------------------------------------------

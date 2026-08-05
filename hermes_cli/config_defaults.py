@@ -379,7 +379,7 @@ DEFAULT_CONFIG = {
         "backend": "nemo_retriever",  # only backend today
         "local": False,               # true for a local GPU NeMo Retriever deployment (no NVIDIA_API_KEY needed)
         "top_k": 5,                   # passages returned per query (1-50)
-        "hybrid": True,               # BM25 full-text + dense vector fused via RRF; false = BM25-only
+        "hybrid": False,              # BM25+dense hybrid when SDK supports it; 26.5.0 pin is dense-only at query time
         "rerank": False,              # apply the NeMo reranker NIM on top of retrieval
         "index_dir": "",              # LanceDB directory; blank = HERMES_HOME/nemo_retriever
         "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
