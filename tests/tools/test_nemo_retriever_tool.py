@@ -195,6 +195,208 @@ def test_query_hybrid_forced_off_on_pinned_sdk():
     assert nrt._query_hybrid_enabled({}) is False
 
 
+def test_resolve_embedding_endpoint_local_skips_cloud_default():
+    assert nrt._resolve_embedding_endpoint({"local": True}) is None
+    assert nrt._resolve_embedding_endpoint({"local": True, "embedding_endpoint": ""}) is None
+    assert nrt._resolve_embedding_endpoint({"local": True, "embedding_endpoint": "none"}) is None
+    assert nrt._resolve_embedding_endpoint({"local": True, "embedding_endpoint": "hf"}) is None
+    assert (
+        nrt._resolve_embedding_endpoint(
+            {"local": True, "embedding_endpoint": "https://example.com/v1/embeddings"}
+        )
+        is None
+    )
+
+
+def test_resolve_embedding_endpoint_remote_default_when_not_local():
+    assert (
+        nrt._resolve_embedding_endpoint({"local": False})
+        == nrt.DEFAULT_EMBEDDING_ENDPOINT
+    )
+    assert (
+        nrt._resolve_embedding_endpoint(
+            {"local": False, "embedding_endpoint": "https://example.com/v1/embeddings"}
+        )
+        == "https://example.com/v1/embeddings"
+    )
+
+
+def test_embed_kwargs_local_hf_omits_endpoint():
+    kw = nrt._embed_kwargs(
+        {
+            "local": True,
+            "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
+            "local_ingest_embed_backend": "hf",
+            "local_hf_device": "cuda:0",
+        }
+    )
+    assert "embedding_endpoint" not in kw
+    assert "embed_invoke_url" not in kw
+    assert "local_hf_device" not in kw
+    assert kw["model_name"] == "nvidia/llama-nemotron-embed-1b-v2"
+    assert kw["local_ingest_embed_backend"] == "hf"
+    assert kw["runtime"]["device"] == "cuda:0"
+    assert nrt._is_local_mode(
+        {"local": True, "embedding_model": "nvidia/llama-nemotron-embed-1b-v2"}
+    )
+
+
+def test_embed_kwargs_remote_includes_endpoint():
+    kw = nrt._embed_kwargs(
+        {
+            "local": False,
+            "embedding_endpoint": "https://integrate.api.nvidia.com/v1/embeddings",
+            "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
+        }
+    )
+    assert kw["embedding_endpoint"].startswith("https://")
+    assert kw["embed_invoke_url"] == kw["embedding_endpoint"]
+    assert "local_ingest_embed_backend" not in kw
+
+
+def test_extract_kwargs_local_disables_remote_page_elements():
+    kw = nrt._extract_kwargs(
+        {
+            "local": True,
+            "use_page_elements": True,
+            "extract_tables": True,
+            "extract_charts": True,
+        }
+    )
+    assert kw["method"] == "pdfium"
+    assert kw["use_page_elements"] is False
+    assert kw["extract_tables"] is False
+    assert kw["extract_charts"] is False
+
+
+def test_ingest_documents_local_passes_hf_embed_kwargs(monkeypatch, tmp_path):
+    calls = {}
+
+    class _FakeIngestor:
+        def files(self, files):
+            return self
+
+        def extract(self, **kw):
+            calls["extract"] = kw
+            return self
+
+        def embed(self, **kw):
+            calls["embed"] = kw
+            return self
+
+        def vdb_upload(self, params=None, **kwargs):
+            return self
+
+        def ingest(self):
+            calls["ingest"] = True
+
+    import sys
+    import types
+
+    fake_nr = types.ModuleType("nemo_retriever")
+    fake_nr.create_ingestor = lambda **kw: _FakeIngestor()
+    fake_params = types.ModuleType("nemo_retriever.params")
+
+    class _FakeEmbedParams:
+        @classmethod
+        def model_validate(cls, data):
+            calls["validated"] = data
+            return data
+
+    fake_params.EmbedParams = _FakeEmbedParams
+    monkeypatch.setitem(sys.modules, "nemo_retriever", fake_nr)
+    monkeypatch.setitem(sys.modules, "nemo_retriever.params", fake_params)
+    monkeypatch.setattr(nrt, "_verify_local_embedder", lambda cfg: None)
+
+    pdf = tmp_path / "a.pdf"
+    pdf.write_text("x", encoding="utf-8")
+    nrt._ingest_documents(
+        [str(pdf)],
+        tmp_path / "idx",
+        "docs_test",
+        {"local": True, "embedding_endpoint": "", "local_ingest_embed_backend": "hf"},
+    )
+
+    assert calls.get("ingest") is True
+    embed = calls.get("embed") or {}
+    validated = calls.get("validated") or {}
+    assert "embed_invoke_url" not in validated
+    assert "embedding_endpoint" not in validated
+    assert validated.get("local_ingest_embed_backend") == "hf"
+    assert validated.get("runtime", {}).get("device") == "cuda:0"
+    assert embed.get("params") is validated
+    extract = calls.get("extract") or {}
+    assert extract.get("use_page_elements") is False
+
+
+def _install_fake_embedder_module(monkeypatch, factory):
+    import sys
+    import types
+
+    fake_nr = types.ModuleType("nemo_retriever")
+    fake_nr.__path__ = []  # mark as package so `nemo_retriever.model` resolves
+    fake_model = types.ModuleType("nemo_retriever.model")
+    fake_model.create_local_embedder = factory
+    monkeypatch.setitem(sys.modules, "nemo_retriever", fake_nr)
+    monkeypatch.setitem(sys.modules, "nemo_retriever.model", fake_model)
+
+
+def test_require_local_cuda_rejects_unavailable_gpu(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="No remote fallback was attempted"):
+        nrt._require_local_cuda({"local": True, "local_hf_device": "cuda:0"})
+
+
+def test_require_local_cuda_accepts_configured_gpu(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert (
+        nrt._require_local_cuda({"local": True, "local_hf_device": "cuda:0"})
+        == "cuda:0"
+    )
+
+
+def test_require_local_cuda_rejects_cpu_device():
+    with pytest.raises(RuntimeError, match="strict local GPU mode"):
+        nrt._require_local_cuda({"local": True, "local_hf_device": "cpu"})
+
+
+def test_verify_local_embedder_raises_actionable_error(monkeypatch):
+    """A broken local embedder must fail up front, not silently embed nothing."""
+
+    def _boom(*a, **kw):
+        raise ModuleNotFoundError("No module named 'transformers'")
+
+    _install_fake_embedder_module(monkeypatch, _boom)
+    monkeypatch.setattr(nrt, "_require_local_cuda", lambda cfg: "cuda:0")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        nrt._verify_local_embedder(
+            {"local": True, "embedding_endpoint": "", "local_ingest_embed_backend": "hf"}
+        )
+
+    msg = str(excinfo.value)
+    assert "transformers" in msg
+    assert "embedding_endpoint" in msg
+
+
+def test_verify_local_embedder_accepts_vectors(monkeypatch):
+    class _Embedder:
+        def embed(self, texts, batch_size=1):
+            return [[0.1, 0.2, 0.3] for _ in texts]
+
+    _install_fake_embedder_module(monkeypatch, lambda *a, **kw: _Embedder())
+    monkeypatch.setattr(nrt, "_require_local_cuda", lambda cfg: "cuda:0")
+
+    nrt._verify_local_embedder(
+        {"local": True, "embedding_endpoint": "", "local_ingest_embed_backend": "hf"}
+    )
+
+
 def test_query_index_falls_back_to_dense_on_hybrid_not_implemented(monkeypatch, tmp_path):
     """If hybrid somehow gets enabled and SDK raises, retry dense."""
     import sys
@@ -304,18 +506,21 @@ def test_ingest_documents_passes_lancedb_string_not_instance(monkeypatch, tmp_pa
         create_calls.update(kw)
         return _FakeIngestor()
 
-    monkeypatch.setattr(
-        "nemo_retriever.create_ingestor",
-        _fake_create_ingestor,
-        raising=False,
-    )
-    # Import path used inside _ingest_documents
     import sys
     import types
 
     fake_nr = types.ModuleType("nemo_retriever")
     fake_nr.create_ingestor = _fake_create_ingestor
+    fake_params = types.ModuleType("nemo_retriever.params")
+
+    class _FakeEmbedParams:
+        @classmethod
+        def model_validate(cls, data):
+            return data
+
+    fake_params.EmbedParams = _FakeEmbedParams
     monkeypatch.setitem(sys.modules, "nemo_retriever", fake_nr)
+    monkeypatch.setitem(sys.modules, "nemo_retriever.params", fake_params)
 
     pdf = tmp_path / "a.pdf"
     pdf.write_text("x", encoding="utf-8")

@@ -129,6 +129,23 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # FeatureUnavailable rather than breaking the base install.
     "document_search.nemo_retriever": ("nemo-retriever==26.5.0",),
 
+    # Local embedding models for `document_search.local: true` — the SDK loads
+    # nvidia/llama-nemotron-embed-1b-v2 through transformers instead of calling
+    # a remote embedding NIM. Mirrors nemo-retriever's own `local` extra minus
+    # its torch/torchvision pins: torch is left to whatever build the host
+    # already has (CUDA wheels here), since forcing the extra's torch==2.11.0
+    # would replace a working GPU install with a generic one.
+    #
+    # NOTE: transformers <5 requires huggingface-hub <1.0, which conflicts with
+    # the huggingface-hub==1.24.0 pin under `tool.trace_upload`. The two
+    # features cannot be installed in the same venv until nemo-retriever
+    # supports transformers 5.x.
+    "document_search.nemo_retriever_local": (
+        "transformers==4.57.6",
+        "accelerate==1.14.0",
+        "einops==0.8.2",
+    ),
+
     # ─── Monitoring ─────────────────────────────────────────────────────────
     # OTLP gateway monitoring export. Lazily installed on first use of
     # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the

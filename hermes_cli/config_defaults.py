@@ -371,20 +371,30 @@ DEFAULT_CONFIG = {
     # Document search via NVIDIA NeMo Retriever (the `document_search` tool /
     # opt-in toolset). Routes "search my PDFs / Word docs / HTML pages" through
     # BM25 lexical + dense hybrid retrieval instead of a ripgrep scan of binary
-    # files. The tool is invisible unless NVIDIA_API_KEY is set (remote
-    # build.nvidia.com / NIM inference) or `local: true` (local GPU
-    # deployment), AND the `document_search` toolset is enabled in `hermes
-    # tools`. Indexes persist under HERMES_HOME/nemo_retriever by default.
+    # files. Defaults to strict local GPU HuggingFace embeddings (`local: true`,
+    # `local_hf_device: cuda:0`). In local mode, remote embedding endpoints,
+    # remote page-element extraction, and remote reranking are never used. Set
+    # local:false plus an https embedding_endpoint to opt into NIM inference.
+    # The tool is
+    # invisible unless NVIDIA_API_KEY is set or `local: true`, AND the
+    # `document_search` toolset is enabled in `hermes tools`. Indexes persist
+    # under HERMES_HOME/nemo_retriever by default.
     "document_search": {
         "backend": "nemo_retriever",  # only backend today
-        "local": False,               # true for a local GPU NeMo Retriever deployment (no NVIDIA_API_KEY needed)
+        # true = strict local GPU HuggingFace / vLLM embeddings. A configured
+        # remote endpoint is ignored and unavailable CUDA fails closed.
+        "local": True,
         "top_k": 5,                   # passages returned per query (1-50)
         "hybrid": False,              # BM25+dense hybrid when SDK supports it; 26.5.0 pin is dense-only at query time
-        "rerank": False,              # apply the NeMo reranker NIM on top of retrieval
+        "rerank": False,              # remote-only in NRL 26.5.0; forced off when local:true
         "index_dir": "",              # LanceDB directory; blank = HERMES_HOME/nemo_retriever
         "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
-        "embedding_endpoint": "https://integrate.api.nvidia.com/v1/embeddings",
-        "extract_method": "",         # blank = SDK default; "nemotron_parse" for scanned/image PDFs
+        # Ignored when local:true. Set local:false plus an https://… URL for remote NIM embeddings.
+        "embedding_endpoint": "",
+        "local_ingest_embed_backend": "hf",  # "hf" (HuggingFace) or "vllm"
+        "local_hf_device": "cuda:0",  # strict local GPU device; no CPU/remote fallback
+        "local_hf_cache_dir": "",     # optional HF cache override
+        "extract_method": "",         # blank = pdfium when local; "nemotron_parse" for scanned/image PDFs
         "max_chars": 20000,           # cap on returned passage text length
     },
 

@@ -31,8 +31,8 @@ uninstalled — unless **both** of these are true:
 2. NeMo Retriever is configured, i.e. either:
    - `NVIDIA_API_KEY` is set (remote inference against
      [build.nvidia.com](https://build.nvidia.com/) or a NIM endpoint), **or**
-   - `document_search.local: true` is set in `config.yaml` (a local
-     GPU deployment).
+   - `document_search.local: true` is set in `config.yaml` (local HuggingFace /
+     vLLM embeddings; default).
 
 ```bash
 hermes tools
@@ -57,15 +57,33 @@ a clear message rather than affecting the rest of Hermes.
 # ~/.hermes/config.yaml
 document_search:
   backend: nemo_retriever   # only backend today
-  local: false              # true = local GPU deployment (no NVIDIA_API_KEY needed)
+  local: true               # strict local GPU HuggingFace / vLLM embeddings (default)
   top_k: 5                  # passages returned per query (1-50)
   hybrid: false             # dense vector retrieval (hybrid BM25+dense not usable on nemo-retriever 26.5.0)
-  rerank: false             # apply the NeMo reranker NIM on top of retrieval
+  rerank: false             # remote-only in NRL 26.5.0; forced off in local mode
   index_dir: ""             # LanceDB directory; blank = HERMES_HOME/nemo_retriever
   embedding_model: nvidia/llama-nemotron-embed-1b-v2
-  embedding_endpoint: https://integrate.api.nvidia.com/v1/embeddings
-  extract_method: ""        # blank = default; "nemotron_parse" for scanned/image PDFs
+  embedding_endpoint: ""    # ignored in local mode; local:false enables remote NIM
+  local_ingest_embed_backend: hf  # hf (HuggingFace transformers) or vllm
+  local_hf_device: "cuda:0" # required CUDA device; no CPU/remote fallback
+  local_hf_cache_dir: ""    # optional Hugging Face cache override
+  extract_method: ""        # blank = pdfium when local; "nemotron_parse" for scanned/image PDFs
   max_chars: 20000          # cap on returned passage text length
+```
+
+With `local: true`, ingest and query load `embedding_model` from the Hugging
+Face Hub (or your local HF cache) onto the configured CUDA device. It is a
+strict, fail-closed mode: configured HTTP embedding endpoints are ignored,
+CPU fallback is rejected, reranking is disabled, and PDF extraction remains
+pdfium text-only so page-element / table / chart NIMs are never contacted.
+If CUDA is unavailable, the tool reports that directly and makes no remote
+request. To use remote embeddings instead:
+
+```yaml
+document_search:
+  local: false
+  embedding_endpoint: https://integrate.api.nvidia.com/v1/embeddings
+  embedding_model: nvidia/llama-nemotron-embed-1b-v2
 ```
 
 On the pinned `nemo-retriever==26.5.0` SDK, queries use **dense** vector retrieval.
@@ -104,10 +122,26 @@ The agent will:
 
 ### "Document search is not configured"
 
-Set `NVIDIA_API_KEY` in `~/.hermes/.env` (from
-[build.nvidia.com](https://build.nvidia.com/)), or set
-`document_search.local: true` for a local GPU deployment. Then restart your
+Set `document_search.local: true` in `config.yaml` (default) to use local
+HuggingFace embedding models with no remote embedding endpoint, **or** set
+`NVIDIA_API_KEY` in `~/.hermes/.env` (from
+[build.nvidia.com](https://build.nvidia.com/)) and an `embedding_endpoint`
+URL for remote NIM embeddings. Then restart your
 session so the agent re-reads the tool registry.
+
+### "strict local GPU inference" / `torch.cuda.is_available() is false`
+
+Verify all three checks from the same environment that launches Hermes:
+
+```bash
+nvidia-smi
+ls -l /dev/nvidia*
+/path/to/hermes-agent/.venv/bin/python -c \
+  "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+On a DGX Spark after a kernel update, ensure the NVIDIA kernel module package
+matches `uname -r`; CUDA user-space libraries alone are not sufficient.
 
 ### Tool doesn't appear in the schema
 

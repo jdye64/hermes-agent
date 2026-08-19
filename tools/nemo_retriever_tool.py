@@ -15,7 +15,8 @@ This is a **service-gated** tool (Footprint Ladder rung 3). It lives in its own
 opt-in ``document_search`` toolset (NOT in ``_HERMES_CORE_TOOLS``) and its
 ``check_fn`` only reports available when a NeMo Retriever credential is present
 (``NVIDIA_API_KEY`` for remote build.nvidia.com / NIM inference, or
-``document_search.local: true`` for a local GPU deployment). With neither
+``document_search.local: true`` for local HuggingFace / vLLM embeddings with
+no remote embedding endpoint). With neither
 configured the tool never reaches the model schema — zero permanent footprint.
 Ripgrep-backed ``search_files`` stays the tool for code/text; this is
 purely for document *corpora*.
@@ -52,7 +53,10 @@ SUPPORTED_EXTENSIONS = frozenset({".pdf", ".doc", ".docx", ".html", ".htm"})
 
 DEFAULT_EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
 DEFAULT_EMBEDDING_ENDPOINT = "https://integrate.api.nvidia.com/v1/embeddings"
+DEFAULT_LOCAL_EMBED_BACKEND = "hf"  # HuggingFace transformers; also accepts "vllm"
+_REMOTE_ENDPOINT_OFF = frozenset({"", "none", "null", "local", "hf", "off", "false"})
 _LAZY_FEATURE = "document_search.nemo_retriever"
+_LAZY_LOCAL_FEATURE = "document_search.nemo_retriever_local"
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +78,125 @@ def _load_config() -> dict:
         return {}
 
 
+def _is_local_mode(cfg: Optional[dict] = None) -> bool:
+    """Whether document_search should run fully local (no remote NIM/HTTP).
+
+    ``document_search.local: true`` opts into strict local GPU HuggingFace /
+    vLLM models for embeddings and pdfium-only extraction. It takes precedence
+    over stale endpoint configuration so local mode cannot leak to HTTP.
+    """
+    cfg = cfg if cfg is not None else _load_config()
+    endpoint = _resolve_embedding_endpoint(cfg)
+    if endpoint:
+        return False
+    return bool(cfg.get("local", False))
+
+
+def _resolve_embedding_endpoint(cfg: dict) -> Optional[str]:
+    """Return a remote embedding URL, or ``None`` to use local HF/vLLM models.
+
+    ``local: true`` always returns ``None``. Otherwise, empty / ``none`` /
+    ``local`` / ``hf`` values mean "no remote endpoint"; an absent key keeps
+    the historical cloud default for existing remote setups.
+    """
+    if bool(cfg.get("local", False)):
+        configured = str(cfg.get("embedding_endpoint") or "").strip()
+        if configured and configured.lower() not in _REMOTE_ENDPOINT_OFF:
+            logger.warning(
+                "Ignoring document_search.embedding_endpoint=%r because "
+                "document_search.local=true is strict local-only mode.",
+                configured,
+            )
+        return None
+    if "embedding_endpoint" not in cfg:
+        return DEFAULT_EMBEDDING_ENDPOINT
+    raw = cfg.get("embedding_endpoint")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.lower() in _REMOTE_ENDPOINT_OFF:
+        return None
+    return text
+
+
+def _resolve_embed_model(cfg: dict) -> str:
+    return str(cfg.get("embedding_model") or DEFAULT_EMBEDDING_MODEL).strip() or DEFAULT_EMBEDDING_MODEL
+
+
+def _resolve_local_embed_backend(cfg: dict) -> str:
+    backend = str(cfg.get("local_ingest_embed_backend") or DEFAULT_LOCAL_EMBED_BACKEND).strip().lower()
+    if backend not in ("hf", "vllm"):
+        logger.warning(
+            "document_search.local_ingest_embed_backend=%r invalid; using %r",
+            backend,
+            DEFAULT_LOCAL_EMBED_BACKEND,
+        )
+        return DEFAULT_LOCAL_EMBED_BACKEND
+    return backend
+
+
+def _embed_kwargs(cfg: dict) -> Dict[str, Any]:
+    """Build NeMo Retriever ``EmbedParams`` / retriever ``embed_kwargs``.
+
+    Local mode omits ``embedding_endpoint`` / ``embed_invoke_url`` so the SDK
+    loads a local HuggingFace (or vLLM) embedder via ``create_local_embedder``.
+    Remote mode keeps the HTTP NIM path.
+    """
+    model = _resolve_embed_model(cfg)
+    endpoint = _resolve_embedding_endpoint(cfg)
+    kwargs: Dict[str, Any] = {
+        "model_name": model,
+        "embed_model_name": model,
+        "embed_modality": "text",
+    }
+    if endpoint:
+        kwargs["embedding_endpoint"] = endpoint
+        kwargs["embed_invoke_url"] = endpoint
+        return kwargs
+
+    kwargs["local_ingest_embed_backend"] = _resolve_local_embed_backend(cfg)
+    # EmbedParams accepts device / cache under nested ``runtime`` (NRL 26.5.0).
+    # Top-level ``local_hf_device`` is rejected by Retriever.model_validate.
+    runtime: Dict[str, Any] = {
+        "device": str(cfg.get("local_hf_device") or "cuda:0").strip(),
+    }
+    cache_dir = str(cfg.get("local_hf_cache_dir") or "").strip()
+    if cache_dir:
+        runtime["hf_cache_dir"] = os.path.expanduser(cache_dir)
+    kwargs["runtime"] = runtime
+    return kwargs
+
+
+def _extract_kwargs(cfg: dict) -> Dict[str, Any]:
+    """Build extract kwargs. Local mode stays offline (pdfium text only).
+
+    Default SDK extract enables page-element / table / chart stages whose CPU
+    fallbacks hit ``ai.api.nvidia.com``. When running local embeddings we
+    disable those unless the user explicitly re-enables them in config.
+    """
+    method = str(cfg.get("extract_method") or "").strip()
+    if not _is_local_mode(cfg):
+        return {"method": method} if method else {}
+
+    kwargs: Dict[str, Any] = {
+        "method": method or "pdfium",
+        # These stages use remote NVIDIA services in nemo-retriever 26.5.0.
+        # Strict local mode never enables them, even if stale config says true.
+        "use_page_elements": False,
+        "use_table_structure": False,
+        "use_graphic_elements": False,
+        "extract_tables": False,
+        "extract_charts": False,
+        "extract_infographics": False,
+    }
+    return kwargs
+
+
 def check_document_search_requirements() -> bool:
     """``check_fn`` gate: available only when NeMo Retriever is configured.
 
     True when a remote NeMo Retriever credential is set (``NVIDIA_API_KEY``)
-    or the user has opted into a local GPU deployment
+    or the user has opted into a local GPU / HuggingFace deployment
     (``document_search.local: true``). This keeps the tool — and the entire
     heavy ``nemo-retriever`` dependency — invisible to every session that
     hasn't configured it.
@@ -175,8 +293,12 @@ def _table_exists(uri: Path, table_name: str) -> bool:
 # NeMo Retriever SDK boundary (isolated for testability)
 # ---------------------------------------------------------------------------
 
-def _ensure_sdk() -> None:
+def _ensure_sdk(cfg: Optional[dict] = None) -> None:
     """Lazily install the ``nemo-retriever`` SDK, raising a clear error.
+
+    In local mode the transformers-backed embedder is also required; without it
+    every embed call fails *silently* inside the SDK's graph, producing an
+    empty index and an opaque "Expected query embeddings" error at query time.
 
     Kept separate from the SDK imports so unit tests can monkeypatch the
     higher-level search boundary without touching pip.
@@ -190,6 +312,105 @@ def _ensure_sdk() -> None:
             "NVIDIA NeMo Retriever SDK is not installed. "
             f"{exc} The nemo-retriever package requires Python 3.12."
         ) from exc
+
+    if _is_local_mode(cfg if cfg is not None else _load_config()):
+        try:
+            ensure(_LAZY_LOCAL_FEATURE, prompt=False)
+        except FeatureUnavailable as exc:
+            raise RuntimeError(
+                "document_search is configured for local embeddings "
+                "(document_search.local: true with no embedding_endpoint), "
+                "which needs the transformers-backed embedder. "
+                f"{exc} Install with: "
+                "pip install 'transformers>=4.57.6,<5' accelerate einops — "
+                "or set document_search.embedding_endpoint to use a remote NIM."
+            ) from exc
+
+
+def _require_local_cuda(cfg: dict) -> str:
+    """Return the configured CUDA device or fail before NRL can fall back remote.
+
+    NeMo Retriever 26.5.0 resolves its embedding archetype to a remote-only CPU
+    operator when CUDA is unavailable. Local mode is intentionally fail-closed:
+    it must never substitute a hosted embedding endpoint or silently run the
+    1B model on CPU.
+    """
+    if not _is_local_mode(cfg):
+        return ""
+
+    device = str(cfg.get("local_hf_device") or "cuda:0").strip()
+    if not device.startswith("cuda"):
+        raise RuntimeError(
+            "document_search.local=true requires a CUDA device; "
+            f"local_hf_device={device!r} is not allowed in strict local GPU mode."
+        )
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "document_search local GPU mode requires a CUDA-enabled PyTorch install."
+        ) from exc
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "document_search is configured for strict local GPU inference, but "
+            "torch.cuda.is_available() is false. No remote fallback was attempted. "
+            "Expose the DGX Spark GPU to this process and verify `nvidia-smi` and "
+            "the NVIDIA kernel driver before rebuilding the index."
+        )
+
+    try:
+        index = int(device.split(":", 1)[1]) if ":" in device else 0
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid CUDA device {device!r}; expected e.g. 'cuda:0'.") from exc
+    if index < 0 or index >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"Configured CUDA device {device!r} does not exist; "
+            f"PyTorch sees {torch.cuda.device_count()} CUDA device(s)."
+        )
+    return device
+
+
+def _verify_local_embedder(cfg: dict) -> None:
+    """Fail loudly if local embeddings cannot produce a vector.
+
+    The SDK swallows per-batch embedding exceptions, so a broken local embedder
+    surfaces as a zero-row index or a confusing missing-``embedding``-column
+    error much later. One tiny embed call up front turns that into a direct
+    message naming the real cause.
+    """
+    from nemo_retriever.model import create_local_embedder  # type: ignore
+
+    model = _resolve_embed_model(cfg)
+    backend = _resolve_local_embed_backend(cfg)
+    device = _require_local_cuda(cfg)
+    try:
+        embedder = create_local_embedder(
+            model,
+            backend=backend,
+            device=device,
+            hf_cache_dir=(
+                os.path.expanduser(str(cfg.get("local_hf_cache_dir")).strip())
+                if str(cfg.get("local_hf_cache_dir") or "").strip()
+                else None
+            ),
+        )
+        vectors = embedder.embed(["hermes document_search preflight"], batch_size=1)
+    except Exception as exc:
+        raise RuntimeError(
+            f"local embedding model {model!r} (backend={backend}) is unusable: "
+            f"{type(exc).__name__}: {exc}. "
+            "Fix the local GPU/model setup. To opt into a remote NIM instead, "
+            "set document_search.local=false and configure embedding_endpoint."
+        ) from exc
+
+    length = getattr(vectors, "shape", None)
+    if length is None and not vectors:
+        raise RuntimeError(
+            f"local embedding model {model!r} returned no vectors; refusing to "
+            "build an empty index."
+        )
 
 
 def _ingest_documents(files: List[str], uri: Path, table_name: str, cfg: dict) -> None:
@@ -208,20 +429,31 @@ def _ingest_documents(files: List[str], uri: Path, table_name: str, cfg: dict) -
     # ingest to dense-only unless/until the SDK supports hybrid query.
     hybrid = _query_hybrid_enabled(cfg)
 
+    if _is_local_mode(cfg):
+        _verify_local_embedder(cfg)
+
     ingestor = create_ingestor(run_mode="inprocess")
     ingestor = ingestor.files(files)
 
-    extract_method = str(cfg.get("extract_method") or "").strip()
-    if extract_method:
-        ingestor = ingestor.extract(method=extract_method)
+    extract_kwargs = _extract_kwargs(cfg)
+    if extract_kwargs:
+        ingestor = ingestor.extract(**extract_kwargs)
     else:
         ingestor = ingestor.extract()
 
-    ingestor = ingestor.embed(
-        model_name=str(cfg.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
-        embed_invoke_url=str(cfg.get("embedding_endpoint") or DEFAULT_EMBEDDING_ENDPOINT),
-        embed_modality="text",
-    )
+    embed_kwargs = _embed_kwargs(cfg)
+    if _is_local_mode(cfg):
+        logger.info(
+            "document_search ingest using local embeddings "
+            "(model=%s backend=%s; no remote embedding endpoint)",
+            embed_kwargs.get("model_name"),
+            embed_kwargs.get("local_ingest_embed_backend"),
+        )
+    # GraphIngestor.embed(**kwargs) uses model_copy and will not coerce a nested
+    # ``runtime`` dict into ModelRuntimeParams; validate first so device sticks.
+    from nemo_retriever.params import EmbedParams  # type: ignore
+
+    ingestor = ingestor.embed(params=EmbedParams.model_validate(embed_kwargs))
     # vdb_op must be the backend name string; kwargs configure LanceDB.
     ingestor = ingestor.vdb_upload(
         vdb_op="lancedb",
@@ -261,16 +493,16 @@ def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) 
         "table_name": table_name,
         "hybrid": hybrid,
     }
-    embed_model = str(cfg.get("embedding_model") or DEFAULT_EMBEDDING_MODEL)
+    embed_kwargs = _embed_kwargs(cfg)
+    # Retriever defaults to run_mode="local", which loads a local HF/vLLM
+    # embedder when no embedding_endpoint is present.
     retriever = Retriever(
+        run_mode="local" if _is_local_mode(cfg) else "service",
         vdb_kwargs=vdb_kwargs,
-        embed_kwargs={
-            "model_name": embed_model,
-            "embed_model_name": embed_model,
-            "embedding_endpoint": str(cfg.get("embedding_endpoint") or DEFAULT_EMBEDDING_ENDPOINT),
-        },
+        embed_kwargs=embed_kwargs,
         top_k=top_k,
-        rerank=bool(cfg.get("rerank", False)),
+        # NRL 26.5.0 reranking is remote-only. Local mode is fail-closed.
+        rerank=False if _is_local_mode(cfg) else bool(cfg.get("rerank", False)),
     )
     try:
         hits = retriever.query(query)
@@ -285,16 +517,11 @@ def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) 
         )
         vdb_kwargs = {**vdb_kwargs, "hybrid": False}
         retriever = Retriever(
+            run_mode="local" if _is_local_mode(cfg) else "service",
             vdb_kwargs=vdb_kwargs,
-            embed_kwargs={
-                "model_name": embed_model,
-                "embed_model_name": embed_model,
-                "embedding_endpoint": str(
-                    cfg.get("embedding_endpoint") or DEFAULT_EMBEDDING_ENDPOINT
-                ),
-            },
+            embed_kwargs=embed_kwargs,
             top_k=top_k,
-            rerank=bool(cfg.get("rerank", False)),
+            rerank=False if _is_local_mode(cfg) else bool(cfg.get("rerank", False)),
         )
         hits = retriever.query(query)
     return list(hits or [])
@@ -315,7 +542,7 @@ def _nemo_retriever_search(
     two helpers it calls) so the suite never needs the real ``nemo-retriever``
     package or a GPU/API key.
     """
-    _ensure_sdk()
+    _ensure_sdk(cfg)
     did_ingest = False
     if reindex or not _table_exists(uri, table_name):
         _ingest_documents(files, uri, table_name, cfg)
@@ -388,8 +615,8 @@ def document_search(
         return tool_error(
             "Document search is not configured. Set NVIDIA_API_KEY (from "
             "https://build.nvidia.com/) for remote NeMo Retriever inference, or "
-            "set `document_search.local: true` in config.yaml for a local GPU "
-            "deployment."
+            "set `document_search.local: true` in config.yaml to use local "
+            "HuggingFace embedding models (no remote embedding endpoint)."
         )
 
     cfg = _load_config()
