@@ -7,13 +7,15 @@ bridge — the same one ``read_terminal`` uses: tui_gateway emits
 ``preview.read.request``, the renderer serializes the active preview tab and
 answers with ``preview.read.respond``. This module is just schema + a thin
 dispatcher over the platform-injected callback.
+
+Lives in the ``desktop_ui`` toolset, which the GUI gateway enables only for
+desktop-sourced sessions.
 """
 
 import json
 from typing import Callable, Optional
 
 from tools.registry import registry, tool_error
-from utils import env_var_enabled
 
 
 def read_preview_tool(
@@ -49,11 +51,6 @@ def read_preview_tool(
         return json.dumps({"text": str(raw)}, ensure_ascii=False)
 
 
-def check_read_preview_requirements() -> bool:
-    """Desktop GUI only — HERMES_DESKTOP is set on the gateway the app spawns."""
-    return env_var_enabled("HERMES_DESKTOP")
-
-
 READ_PREVIEW_SCHEMA = {
     "name": "read_preview",
     "description": (
@@ -66,7 +63,7 @@ READ_PREVIEW_SCHEMA = {
         "per read); a file tab answers identity only (read the file with "
         "read_file); an artifact tab points back at the conversation. Use after "
         "open_preview, or whenever the user refers to what's on screen in the "
-        "browser ('what does this page say?')."
+        "browser ('what does this page say?'). To close the pane, use close_preview."
     ),
     "parameters": {
         "type": "object",
@@ -84,15 +81,5 @@ READ_PREVIEW_SCHEMA = {
 }
 
 
-registry.register(
-    name="read_preview",
-    toolset="terminal",
-    schema=READ_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: read_preview_tool(
-        start=args.get("start"),
-        count=args.get("count"),
-        callback=kw.get("callback"),
-    ),
-    check_fn=check_read_preview_requirements,
-    emoji="🔍",
-)
+# Registration removed: consolidated into the `preview` tool (#95681);
+# this module keeps its functions for the agent-level preview action=read dispatch.
