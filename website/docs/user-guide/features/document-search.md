@@ -62,6 +62,8 @@ document_search:
   hybrid: false             # dense vector retrieval (hybrid BM25+dense not usable on nemo-retriever 26.5.0)
   rerank: false             # remote-only in NRL 26.5.0; forced off in local mode
   index_dir: ""             # LanceDB directory; blank = HERMES_HOME/nemo_retriever
+  table_name: ""            # exact provisioned table; blank = managed docs_* name
+  existing_index_only: false # fail instead of ingesting when table_name is absent
   embedding_model: nvidia/llama-nemotron-embed-1b-v2
   embedding_endpoint: ""    # ignored in local mode; local:false enables remote NIM
   local_ingest_embed_backend: hf  # hf (HuggingFace transformers) or vllm
@@ -91,6 +93,22 @@ Setting `hybrid: true` is currently coerced to dense — that SDK raises
 `NotImplementedError` for hybrid search over precomputed query vectors.
 Indexes persist under `HERMES_HOME/nemo_retriever` by default, so each
 [profile](../../reference/profiles.md) gets its own.
+
+For an index provisioned outside Hermes, configure its exact LanceDB directory
+and table name and prevent accidental replacement:
+
+```yaml
+document_search:
+  index_dir: /workspace/lancedb
+  table_name: nemo-retriever
+  existing_index_only: true
+  local: false
+  embedding_endpoint: https://inference-api.nvidia.com/v1/embeddings
+```
+
+The provisioned index must use the same embedding model as the query. With
+`existing_index_only: true`, `reindex: true` is rejected and a missing
+`<table_name>.lance` directory is reported instead of triggering ingestion.
 
 ## Tool parameters
 

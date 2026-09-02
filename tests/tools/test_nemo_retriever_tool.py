@@ -83,6 +83,66 @@ def test_derive_table_name_stable_and_named(tmp_path):
     assert nrt._derive_table_name(files, "My Corpus!") == "docs_My_Corpus_"
 
 
+def test_resolve_table_name_uses_exact_provisioned_table(tmp_path):
+    files = [str(tmp_path / "a.pdf")]
+
+    assert (
+        nrt._resolve_table_name(
+            files,
+            "ignored-managed-name",
+            {"table_name": "nemo-retriever"},
+        )
+        == "nemo-retriever"
+    )
+
+
+def test_existing_index_only_queries_without_ingesting(monkeypatch, tmp_path):
+    uri = tmp_path / "lancedb"
+    (uri / "nemo-retriever.lance").mkdir(parents=True)
+    calls = []
+
+    monkeypatch.setattr(nrt, "_ensure_sdk", lambda cfg: None)
+    monkeypatch.setattr(
+        nrt,
+        "_ingest_documents",
+        lambda *args, **kwargs: calls.append("ingest"),
+    )
+    monkeypatch.setattr(
+        nrt,
+        "_query_index",
+        lambda *args, **kwargs: calls.append("query") or [{"text": "hit"}],
+    )
+
+    hits, did_ingest = nrt._nemo_retriever_search(
+        query="q",
+        files=[str(tmp_path / "a.pdf")],
+        uri=uri,
+        table_name="nemo-retriever",
+        top_k=5,
+        reindex=False,
+        cfg={"existing_index_only": True, "table_name": "nemo-retriever"},
+    )
+
+    assert hits == [{"text": "hit"}]
+    assert did_ingest is False
+    assert calls == ["query"]
+
+
+def test_existing_index_only_reports_missing_table(monkeypatch, tmp_path):
+    monkeypatch.setattr(nrt, "_ensure_sdk", lambda cfg: None)
+
+    with pytest.raises(RuntimeError, match="index is missing"):
+        nrt._nemo_retriever_search(
+            query="q",
+            files=[str(tmp_path / "a.pdf")],
+            uri=tmp_path / "lancedb",
+            table_name="nemo-retriever",
+            top_k=5,
+            reindex=False,
+            cfg={"existing_index_only": True, "table_name": "nemo-retriever"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Argument validation / envelope
 # ---------------------------------------------------------------------------

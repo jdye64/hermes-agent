@@ -281,6 +281,22 @@ def _derive_table_name(files: List[str], index_name: Optional[str]) -> str:
     return f"docs_{digest}"
 
 
+def _resolve_table_name(
+    files: List[str], index_name: Optional[str], cfg: dict
+) -> str:
+    """Resolve an exact configured table or derive the managed table name.
+
+    ``table_name`` is intentionally a config-only escape hatch for deployments
+    that provision LanceDB outside Hermes. User-supplied ``index_name`` keeps
+    the managed ``docs_*`` namespace and cannot redirect a tool call to an
+    arbitrary provisioned table.
+    """
+    configured = str(cfg.get("table_name") or "").strip()
+    if configured:
+        return configured
+    return _derive_table_name(files, index_name)
+
+
 def _table_exists(uri: Path, table_name: str) -> bool:
     """Whether a LanceDB table already exists under ``uri``.
 
@@ -543,8 +559,26 @@ def _nemo_retriever_search(
     package or a GPU/API key.
     """
     _ensure_sdk(cfg)
+    existing_index_only = bool(cfg.get("existing_index_only", False))
+    if existing_index_only and not str(cfg.get("table_name") or "").strip():
+        raise RuntimeError(
+            "document_search.table_name is required when "
+            "document_search.existing_index_only=true."
+        )
+    if existing_index_only and reindex:
+        raise RuntimeError(
+            "document_search.reindex is unavailable when "
+            "document_search.existing_index_only=true."
+        )
     did_ingest = False
-    if reindex or not _table_exists(uri, table_name):
+    table_exists = _table_exists(uri, table_name)
+    if existing_index_only and not table_exists:
+        raise RuntimeError(
+            "Configured document search index is missing: "
+            f"{uri / f'{table_name}.lance'}. "
+            "Provision the table or disable document_search.existing_index_only."
+        )
+    if reindex or not table_exists:
         _ingest_documents(files, uri, table_name, cfg)
         did_ingest = True
     hits = _query_index(query, uri, table_name, top_k, cfg)
@@ -633,7 +667,7 @@ def document_search(
     max_chars = int(cfg.get("max_chars", 20000) or 20000)
 
     uri = _index_root()
-    table_name = _derive_table_name(files, index_name)
+    table_name = _resolve_table_name(files, index_name, cfg)
 
     try:
         raw_hits, did_ingest = _nemo_retriever_search(
