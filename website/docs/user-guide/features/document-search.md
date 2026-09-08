@@ -88,9 +88,10 @@ document_search:
   embedding_model: nvidia/llama-nemotron-embed-1b-v2
 ```
 
-On the pinned `nemo-retriever==26.5.0` SDK, queries use **dense** vector retrieval.
-Setting `hybrid: true` is currently coerced to dense — that SDK raises
-`NotImplementedError` for hybrid search over precomputed query vectors.
+Queries use **dense** vector retrieval. Setting `hybrid: true` is currently
+coerced to dense, because nemo-retriever 26.5.0 raises `NotImplementedError`
+for hybrid search over precomputed query vectors and the SDK version is not
+pinned, so a newer build cannot be assumed.
 Indexes persist under `HERMES_HOME/nemo_retriever` by default, so each
 [profile](../../reference/profiles.md) gets its own.
 
@@ -174,9 +175,15 @@ Two possible causes:
 ### "NVIDIA NeMo Retriever SDK is not installed"
 
 The lazy install failed — most often because the interpreter is not Python 3.12,
-or lazy installs are disabled (`security.allow_lazy_installs: false`). Install
-manually into the agent's environment with `pip install nemo-retriever==26.5.0`
-under a Python 3.12 venv.
+or lazy installs are disabled (`security.allow_lazy_installs: false` or
+`HERMES_DISABLE_LAZY_INSTALLS=1`). Install manually into the agent's environment
+with `pip install nemo-retriever` under a Python 3.12 venv.
+
+This also appears when `nemo-retriever` is installed somewhere Hermes does not
+import from. The check reads `importlib.metadata` in the *running* interpreter,
+so an install into a different environment does not count. If `uv` is doing the
+install, note that `UV_SYSTEM_PYTHON=1` in the environment overrides
+`VIRTUAL_ENV` and will send it to the system interpreter.
 
 ## See Also
 

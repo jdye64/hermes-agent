@@ -485,18 +485,19 @@ def _ingest_documents(files: List[str], uri: Path, table_name: str, cfg: dict) -
 def _query_hybrid_enabled(cfg: dict) -> bool:
     """Whether to request LanceDB hybrid (BM25 + dense) at query time.
 
-    ``nemo-retriever==26.5.0`` (our lazy pin) embeds the query then calls
+    nemo-retriever 26.5.0 embeds the query then calls
     ``LanceDB.retrieval(vectors, ...)``. That path raises
     ``NotImplementedError: LanceDB hybrid retrieval with precomputed vectors
     is not implemented yet`` when ``hybrid=True``. Newer SDK mainline adds
-    hybrid+``query_texts`` support; until we bump the pin, force dense-only
-    so ``document_search`` works. Respect ``hybrid: false`` explicitly;
-    ``hybrid: true`` is accepted but currently coerced to dense.
+    hybrid+``query_texts`` support.
+
+    Forced dense-only for now, so ``document_search`` works on either build:
+    the SDK version is no longer pinned, so this cannot assume mainline. Making
+    this respect ``hybrid`` needs a capability probe rather than a config knob,
+    since guessing wrong fails every query. ``hybrid: true`` is still accepted
+    and coerced to dense.
     """
-    # Keep the config knob, but do not enable hybrid against the broken pin.
-    if not bool(cfg.get("hybrid", False)):
-        return False
-    return False  # flip when lazy_deps pin gains working hybrid query
+    return False
 
 
 def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) -> List[dict]:

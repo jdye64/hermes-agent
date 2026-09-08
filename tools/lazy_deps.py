@@ -127,7 +127,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # the user has set NVIDIA_API_KEY and enabled the toolset. On unsupported
     # interpreters the pip install fails cleanly and surfaces as
     # FeatureUnavailable rather than breaking the base install.
-    "document_search.nemo_retriever": ("nemo-retriever==26.5.0",),
+    #
+    # Deliberately unpinned, unlike the other entries here. nemo-retriever
+    # derives its version at build time from $RETRIEVER_VERSION, falling back to
+    # a build-date stamp, so a source install reports something like
+    # `2025.1.1.dev20250101000000` rather than a release number. Pinning `==`
+    # made every such install look absent: `_is_satisfied` rejected the version,
+    # the tool reported itself as uninstalled, and callers running a deliberately
+    # chosen build got silently downgraded to a release. Presence is the real
+    # requirement, so check only that.
+    "document_search.nemo_retriever": ("nemo-retriever",),
 
     # Local embedding models for `document_search.local: true` — the SDK loads
     # nvidia/llama-nemotron-embed-1b-v2 through transformers instead of calling
