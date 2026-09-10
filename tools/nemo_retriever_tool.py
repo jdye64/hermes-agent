@@ -29,7 +29,7 @@ Exa / Firecrawl / Parallel web-search backends.
 SDK reference: https://github.com/NVIDIA/NeMo-Retriever (the ``nemo-retriever``
 PyPI package). Ingestion uses ``create_ingestor(...).files(...).extract()``
 ``.embed().vdb_upload(vdb_op="lancedb", vdb_kwargs=...)``; querying uses
-``nemo_retriever.retriever.Retriever(...).query(...)``. BM25 is the LanceDB
+``nemo_retriever.graph.retriever.Retriever(...).query(...)``. BM25 is the LanceDB
 full-text component of hybrid retrieval (BM25 FTS + dense, fused with RRF).
 """
 
@@ -502,7 +502,11 @@ def _query_hybrid_enabled(cfg: dict) -> bool:
 
 def _query_index(query: str, uri: Path, table_name: str, top_k: int, cfg: dict) -> List[dict]:
     """Run dense (or hybrid, when supported) retrieval against an existing LanceDB table."""
-    from nemo_retriever.retriever import Retriever  # type: ignore
+    # Not the top-level ``nemo_retriever.retriever``: since the SDK's module
+    # reorg that name is a ready-built instance carrying run_mode="local"
+    # defaults, so using it would silently ignore the kwargs below and demand a
+    # local GPU embedder. The class lives under ``graph`` now.
+    from nemo_retriever.graph.retriever import Retriever  # type: ignore
 
     hybrid = _query_hybrid_enabled(cfg)
     vdb_kwargs: Dict[str, Any] = {

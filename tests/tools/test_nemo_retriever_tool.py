@@ -477,11 +477,17 @@ def test_query_index_falls_back_to_dense_on_hybrid_not_implemented(monkeypatch, 
             return [{"text": "hit", "score": 1.0}]
 
     monkeypatch.setattr(nrt, "_query_hybrid_enabled", lambda cfg: True)
-    if "nemo_retriever" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "nemo_retriever", types.ModuleType("nemo_retriever"))
-    mod = types.ModuleType("nemo_retriever.retriever")
+    fake_nr = types.ModuleType("nemo_retriever")
+    fake_nr.__path__ = []  # mark as package so the graph subpackage resolves
+    fake_graph = types.ModuleType("nemo_retriever.graph")
+    fake_graph.__path__ = []
+    mod = types.ModuleType("nemo_retriever.graph.retriever")
     mod.Retriever = _FakeRetriever
-    monkeypatch.setitem(sys.modules, "nemo_retriever.retriever", mod)
+    fake_graph.retriever = mod
+    fake_nr.graph = fake_graph
+    monkeypatch.setitem(sys.modules, "nemo_retriever", fake_nr)
+    monkeypatch.setitem(sys.modules, "nemo_retriever.graph", fake_graph)
+    monkeypatch.setitem(sys.modules, "nemo_retriever.graph.retriever", mod)
 
     hits = nrt._query_index("coal", tmp_path, "docs_t", 3, {"hybrid": True})
     assert hits == [{"text": "hit", "score": 1.0}]
