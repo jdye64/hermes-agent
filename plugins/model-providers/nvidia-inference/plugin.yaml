@@ -1,0 +1,5 @@
+name: nvidia-inference-provider
+kind: model-provider
+version: 1.0.0
+description: NVIDIA Inference Hub (sk-* keys via inference-api.nvidia.com)
+author: Nous Research
